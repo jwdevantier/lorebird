@@ -8,7 +8,7 @@ mod guile {
     use std::os::raw::c_char;
 
     #[link(name = "guile-3.0")]
-    extern "C" {
+    unsafe extern "C" {
         /// Bootstrap the Guile interpreter. Must be called once.
         pub fn scm_init_guile();
 
