@@ -1,0 +1,10 @@
+[package]
+name = "loreread"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk4 = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+maildir = "0.6"
+libc = "0.2"
