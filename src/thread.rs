@@ -124,6 +124,26 @@ fn build_thread_subtree<T: Message>(
     }
 }
 
+/// Strip leading "re:", "re[4]:" (case-insensitive)
+/// May return empty string if nothing else remains in the subject line
+fn bare_subject(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    loop {
+        let trimmed = s.trim_start();
+        let lower = trimmed.to_lowercase();
+        let rest = lower.strip_prefix("re:").or_else(|| {
+            let x = lower.strip_prefix("re")?.trim_start().strip_prefix('[')?;
+            let close = x.find(']')?;
+            x[close..].strip_prefix("]:")
+        });
+        match rest {
+            Some(r) => s = trimmed[trimmed.len() - r.len()..].trim().to_string(),
+            None => break,
+        }
+    }
+    s
+}
+
 /// Run the JWZ threading algorithm on an unordered collection of messages.
 ///
 /// Returns the root nodes of the thread tree — messages that have no
@@ -217,6 +237,10 @@ pub fn thread_messages<T: Message>(messages: impl IntoIterator<Item = T>) -> Vec
         .flat_map(|idx| build_thread_subtree(idx, &mut cs))
         .collect();
 
+    // old hierarchy in `cs` is stale - `build_thread_subtree`
+    // calls built the new hierarchy.
+    drop(cs);
+
     // Step 5 - Group root set by subject
     // Step 6 - DONE (can discard .parent field of container)
     // Step 7(!) - SORT siblings (by whatever you want)
@@ -269,6 +293,75 @@ mod tests {
             .collect()
     }
 
+    // ── Bare Subject Tests ───────────────────────────────────────
+    #[test]
+    fn subj_no_prefix() {
+        assert_eq!(bare_subject("Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn subj_simple_re() {
+        assert_eq!(bare_subject("Re: Hello"), "Hello");
+    }
+
+    #[test]
+    fn subj_uppercase_re() {
+        assert_eq!(bare_subject("RE: Hello"), "Hello");
+    }
+
+    #[test]
+    fn subj_mixed_case_re() {
+        assert_eq!(bare_subject("rE: Hello"), "Hello");
+    }
+
+    #[test]
+    fn subj_numbered_re() {
+        assert_eq!(bare_subject("Re[5]: Hello"), "Hello");
+    }
+
+    #[test]
+    fn subj_chained_re_prefixes() {
+        assert_eq!(bare_subject("Re: Re[4]: Re: Hello"), "Hello");
+    }
+
+    #[test]
+    fn subj_only_prefix_no_content() {
+        assert_eq!(bare_subject("Re: "), "");
+    }
+
+    #[test]
+    fn subj_only_re_with_colon() {
+        assert_eq!(bare_subject("Re:"), "");
+    }
+
+    #[test]
+    fn subj_leading_whitespace() {
+        assert_eq!(bare_subject("   Re: Hello"), "Hello");
+    }
+
+    #[test]
+    fn subj_empty_string() {
+        assert_eq!(bare_subject(""), "");
+    }
+
+    #[test]
+    fn subj_whitespace_only() {
+        assert_eq!(bare_subject("   "), "");
+    }
+
+    #[test]
+    fn subj_not_a_re_prefix() {
+        // "Regarding: Hello" starts with "Re" but isn't a Re: prefix
+        assert_eq!(bare_subject("Regarding: Hello"), "Regarding: Hello");
+    }
+
+    #[test]
+    fn subj_re_in_middle_of_word() {
+        // "Re" must be at the start (after whitespace) to count
+        assert_eq!(bare_subject("Care: Hello"), "Care: Hello");
+    }
+
+    /*
     // ── Basic linear thread ───────────────────────────────────────
 
     #[test]
@@ -402,4 +495,5 @@ mod tests {
         // but could still be threaded by subject.
         // TODO: define expected behavior
     }
+    */
 }
