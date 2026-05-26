@@ -1,5 +1,5 @@
 {
-  description = "loreread — index and browse a maildir with GTK, Guile, and SQLite";
+  description = "loreread — index and browse a maildir with GTK, Lua, and SQLite";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -32,7 +32,6 @@
 
           buildInputs = with pkgs; [
             gtk4
-            guile
             sqlite-interactive
           ];
 
@@ -47,9 +46,9 @@
           shellHook = ''
             echo "=== loreread dev shell ==="
             echo "Rust:  $(rustc --version)"
-            echo "Guile: $(guile --version | head -1)"
             echo "GTK4:  ${pkgs.gtk4.version}"
             echo "SQLite: $(sqlite3 --version)"
+            echo "Lua:   vendored (mlua)"
           '';
         };
       });
@@ -67,7 +66,6 @@
 
             buildInputs = with pkgs; [
               gtk4
-              guile
             ];
 
             cargoLock = {
