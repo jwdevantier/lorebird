@@ -1,0 +1,13 @@
+[package]
+name = "thread-test"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "thread-test"
+path = "src/main.rs"
+
+[dependencies]
+loreread-core = { path = "../../crates/loreread-core" }
+mail-parser = "0.10"
+clap = { version = "4", features = ["derive"] }

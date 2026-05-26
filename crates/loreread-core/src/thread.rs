@@ -135,7 +135,7 @@ fn _bare_subject(raw: &str) -> (String, usize) {
 
 /// Strip leading "re:", "re[4]:" (case-insensitive)
 /// May return empty string if nothing else remains in the subject line
-fn bare_subject(raw: &str) -> String {
+pub fn bare_subject(raw: &str) -> String {
     let (s, _) = _bare_subject(raw);
     return s;
 }

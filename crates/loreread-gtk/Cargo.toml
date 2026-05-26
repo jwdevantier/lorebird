@@ -1,0 +1,13 @@
+[package]
+name = "loreread"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "loreread"
+path = "src/main.rs"
+
+[dependencies]
+gtk4 = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+loreread-core = { path = "../loreread-core" }
+loreread-lua = { path = "../loreread-lua" }

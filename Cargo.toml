@@ -1,12 +1,9 @@
-[package]
-name = "loreread"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-gtk4 = { version = "0.9", package = "gtk4", features = ["v4_10"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
-maildir = "0.6"
-mail-parser = "0.10"
-mlua = { version = "0.11", features = ["lua54", "vendored", "serialize"] }
-serde = { version = "1", features = ["derive"] }
+[workspace]
+members = [
+    "crates/loreread-core",
+    "crates/loreread-lua",
+    "crates/loreread-gtk",
+    "tools/maildir-index",
+    "tools/thread-test",
+]
+resolver = "3"

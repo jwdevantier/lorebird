@@ -1,0 +1,9 @@
+[package]
+name = "loreread-lua"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mlua = { version = "0.11", features = ["lua54", "vendored", "serialize"] }
+loreread-core = { path = "../loreread-core" }
+serde = { version = "1", features = ["derive"] }
