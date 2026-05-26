@@ -53,23 +53,15 @@ impl<T> Container<T> {
 
 // ── Thread tree ──────────────────────────────────────────────────────
 
-/// Internal representation of a Thread
-///
-/// During processing, there will be some time during which
-/// we may have containers without a message of their own
-/// but which form the root of a thread.
-/// Subsequent cleanup will handle this
-#[derive(Debug)]
-pub struct ThreadNode<T: Message> {
-    pub message: Option<T>,
-    pub children: Vec<ThreadNode<T>>,
-}
-
 /// A node in a thread tree.
+///
+/// Most nodes carry a message. Ghost nodes (created when multiple
+/// messages reference a missing parent, or when messages are grouped
+/// by subject) have `message: None`.
 #[derive(Debug)]
 pub struct Thread<T: Message> {
-    /// The message at this node.
-    pub message: T,
+    /// The message at this node, or `None` for ghost/placeholder nodes.
+    pub message: Option<T>,
     /// Child messages (replies).
     pub children: Vec<Thread<T>>,
 }
@@ -87,11 +79,8 @@ fn is_ancestor<T>(ancestor_idx: usize, descendant_idx: usize, lst: &[Container<T
     false
 }
 
-fn build_thread_subtree<T: Message>(
-    root_idx: usize,
-    cs: &mut Vec<Container<T>>,
-) -> Vec<ThreadNode<T>> {
-    let children: Vec<ThreadNode<T>> = cs[root_idx]
+fn build_thread_subtree<T: Message>(root_idx: usize, cs: &mut Vec<Container<T>>) -> Vec<Thread<T>> {
+    let children: Vec<Thread<T>> = cs[root_idx]
         .children
         .clone()
         .into_iter()
@@ -101,23 +90,20 @@ fn build_thread_subtree<T: Message>(
     let msg = cs[root_idx].message.take();
     let is_root_ghost = cs[root_idx].parent.is_none();
 
-    // * container w/o children or msg -> NUKE
+    // * container w/o children or msg -> REMOVE
     // * container w/o msg, WITH children ->
     //    * remove, promote children
     //    * UNLESS promoting children to root level
     //        * IF there's just one child to promote this way, do it anyway
-    // TODO: to remove a container, we need to:
-    //       - remove the container from parent.children
-    //       - change the .parent ref in each of `children` to the parent of the removed container
     match (msg, children.len(), is_root_ghost) {
-        (Some(msg), _, _) => vec![ThreadNode {
+        (Some(msg), _, _) => vec![Thread {
             message: Some(msg),
             children,
         }],
         (None, 0, _) => vec![],       // ghost node, remove
         (None, 1, _) => children,     // empty container, single child, always promote
         (None, _, false) => children, // promote
-        (None, _, true) => vec![ThreadNode {
+        (None, _, true) => vec![Thread {
             // top-level ghost, multiple children, retain
             message: None,
             children,
@@ -155,7 +141,7 @@ fn bare_subject(raw: &str) -> String {
 }
 
 /// Find first occurrence of a message in subtree and extract its subject
-fn subtree_subject<T: Message>(node: &ThreadNode<T>) -> Option<String> {
+fn subtree_subject<T: Message>(node: &Thread<T>) -> Option<String> {
     if let Some(ref msg) = node.message {
         msg.subject().map(|s| s.to_string())
     } else {
@@ -170,7 +156,7 @@ fn re_depth(subject: &str) -> usize {
     depth
 }
 
-fn subject_re_order<T: Message>(a: &ThreadNode<T>, b: &ThreadNode<T>) -> Ordering {
+fn subject_re_order<T: Message>(a: &Thread<T>, b: &Thread<T>) -> Ordering {
     match (a.message.as_ref(), b.message.as_ref()) {
         (None, Some(_)) => Ordering::Less,
         (Some(_), None) => Ordering::Greater,
@@ -183,9 +169,9 @@ fn subject_re_order<T: Message>(a: &ThreadNode<T>, b: &ThreadNode<T>) -> Orderin
     }
 }
 
-fn group_by_subject<T: Message>(threads: Vec<ThreadNode<T>>) -> Vec<ThreadNode<T>> {
-    let mut subject_table: HashMap<String, ThreadNode<T>> = HashMap::new();
-    let mut orphans: Vec<ThreadNode<T>> = Vec::new(); // no subject -> pass-through
+fn group_by_subject<T: Message>(threads: Vec<Thread<T>>) -> Vec<Thread<T>> {
+    let mut subject_table: HashMap<String, Thread<T>> = HashMap::new();
+    let mut orphans: Vec<Thread<T>> = Vec::new(); // no subject -> pass-through
 
     for node in threads {
         let bare = match subtree_subject(&node) {
@@ -217,7 +203,7 @@ fn group_by_subject<T: Message>(threads: Vec<ThreadNode<T>>) -> Vec<ThreadNode<T
     subject_table.into_values().chain(orphans).collect()
 }
 
-fn merge_threads<T: Message>(winner: ThreadNode<T>, loser: ThreadNode<T>) -> ThreadNode<T> {
+fn merge_threads<T: Message>(winner: Thread<T>, loser: Thread<T>) -> Thread<T> {
     match (winner.message.is_none(), loser.message.is_none()) {
         // Both empty → merge children into winner
         (true, true) => {
@@ -232,7 +218,7 @@ fn merge_threads<T: Message>(winner: ThreadNode<T>, loser: ThreadNode<T>) -> Thr
             winner
         }
         // Both real → siblings under a synthetic empty root
-        (false, false) => ThreadNode {
+        (false, false) => Thread {
             message: None,
             children: vec![winner, loser],
         },
@@ -241,41 +227,6 @@ fn merge_threads<T: Message>(winner: ThreadNode<T>, loser: ThreadNode<T>) -> Thr
             let mut loser = loser;
             loser.children.push(winner);
             loser
-        }
-    }
-}
-
-fn finalize<T: Message>(nodes: Vec<ThreadNode<T>>) -> Vec<Thread<T>> {
-    nodes
-        .into_iter()
-        .flat_map(|node| finalize_one(node))
-        .collect()
-}
-
-/// Convert a single ThreadNode to zero or more Threads.
-/// Ghosts with children promote their first child to become the root;
-/// ghosts with no children disappear entirely.
-fn finalize_one<T: Message>(node: ThreadNode<T>) -> Vec<Thread<T>> {
-    if let Some(msg) = node.message {
-        return vec![Thread {
-            message: msg,
-            children: finalize(node.children),
-        }];
-    }
-
-    // Ghost node — promote first child as the new root, attach the rest
-    let mut children = node.children;
-    match children.len() {
-        0 => vec![],
-        1 => finalize_one(children.remove(0)),
-        _ => {
-            let first = children.remove(0);
-            let mut root = Thread {
-                message: first.message.expect("ghost child must have a message"),
-                children: finalize(first.children),
-            };
-            root.children.extend(finalize(children));
-            vec![root]
         }
     }
 }
@@ -368,7 +319,7 @@ pub fn thread_messages<T: Message>(messages: impl IntoIterator<Item = T>) -> Vec
     //  Removing a container:
     //  remove parent.children ref
     //  re-parent all its children to ITS parent
-    let threads: Vec<ThreadNode<T>> = cs_roots
+    let threads: Vec<Thread<T>> = cs_roots
         .into_iter()
         .flat_map(|idx| build_thread_subtree(idx, &mut cs))
         .collect();
@@ -378,10 +329,7 @@ pub fn thread_messages<T: Message>(messages: impl IntoIterator<Item = T>) -> Vec
     drop(cs);
 
     // Step 5 - Group root set by subject
-    let threads = group_by_subject(threads);
-
-    // Step 6 - Convert ThreadNode → Thread (all messages should be Some by now)
-    finalize(threads)
+    group_by_subject(threads)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -413,9 +361,12 @@ mod tests {
     }
 
     /// Helper: collect message IDs in DFS order for easy assertions.
+    /// Skips ghost nodes (no message).
     fn collect_ids<T: Message>(threads: &[Thread<T>]) -> Vec<Vec<String>> {
         fn walk<T: Message>(t: &Thread<T>, acc: &mut Vec<String>) {
-            acc.push(t.message.message_id().unwrap().to_string());
+            if let Some(ref msg) = t.message {
+                acc.push(msg.message_id().unwrap().to_string());
+            }
             for child in &t.children {
                 walk(child, acc);
             }
@@ -798,13 +749,11 @@ mod tests {
         // This test documents current behavior — TestMessage always has an
         // ID. A real implementation with optional IDs needs its own test.
         // For now, verify the algorithm doesn't crash on normal messages.
-        let messages = vec![
-            TestMessage {
-                id: "has_id".into(),
-                refs: vec![],
-                subject: "Topic".into(),
-            },
-        ];
+        let messages = vec![TestMessage {
+            id: "has_id".into(),
+            refs: vec![],
+            subject: "Topic".into(),
+        }];
         let threads = thread_messages(messages);
         assert_eq!(threads.len(), 1);
     }
