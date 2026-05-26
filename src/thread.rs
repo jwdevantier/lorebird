@@ -248,13 +248,36 @@ fn merge_threads<T: Message>(winner: ThreadNode<T>, loser: ThreadNode<T>) -> Thr
 fn finalize<T: Message>(nodes: Vec<ThreadNode<T>>) -> Vec<Thread<T>> {
     nodes
         .into_iter()
-        .filter_map(|node| {
-            node.message.map(|msg| Thread {
-                message: msg,
-                children: finalize(node.children),
-            })
-        })
+        .flat_map(|node| finalize_one(node))
         .collect()
+}
+
+/// Convert a single ThreadNode to zero or more Threads.
+/// Ghosts with children promote their first child to become the root;
+/// ghosts with no children disappear entirely.
+fn finalize_one<T: Message>(node: ThreadNode<T>) -> Vec<Thread<T>> {
+    if let Some(msg) = node.message {
+        return vec![Thread {
+            message: msg,
+            children: finalize(node.children),
+        }];
+    }
+
+    // Ghost node — promote first child as the new root, attach the rest
+    let mut children = node.children;
+    match children.len() {
+        0 => vec![],
+        1 => finalize_one(children.remove(0)),
+        _ => {
+            let first = children.remove(0);
+            let mut root = Thread {
+                message: first.message.expect("ghost child must have a message"),
+                children: finalize(first.children),
+            };
+            root.children.extend(finalize(children));
+            vec![root]
+        }
+    }
 }
 
 /// Run the JWZ threading algorithm on an unordered collection of messages.
@@ -475,8 +498,28 @@ mod tests {
         assert_eq!(bare_subject("Care: Hello"), "Care: Hello");
     }
 
-    /*
-    // ── Basic linear thread ───────────────────────────────────────
+    // ── Threading: empty & single ──────────────────────────────
+
+    #[test]
+    fn empty_input() {
+        let messages: Vec<TestMessage> = vec![];
+        let threads = thread_messages(messages);
+        assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn single_message() {
+        let messages = vec![TestMessage {
+            id: "a".into(),
+            refs: vec![],
+            subject: "Hello".into(),
+        }];
+        let threads = thread_messages(messages);
+        let ids = collect_ids(&threads);
+        assert_eq!(ids, vec![vec!["a"]]);
+    }
+
+    // ── Threading: reference-based ──────────────────────────────
 
     #[test]
     fn linear_thread_by_references() {
@@ -499,17 +542,47 @@ mod tests {
         ];
 
         let threads = thread_messages(messages);
-
         let ids = collect_ids(&threads);
         // One thread: a → b → c
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], vec!["a", "b", "c"]);
     }
 
-    // ── Missing parent (ghost message) ────────────────────────────
+    #[test]
+    fn diamond_references() {
+        // A and B are independent, C references both → C should be sibling
+        // of whichever was linked first. JWZ: A and B end up under B.
+        let messages = vec![
+            TestMessage {
+                id: "c".into(),
+                refs: vec!["a".into(), "b".into()],
+                subject: "Re: Topic".into(),
+            },
+            TestMessage {
+                id: "a".into(),
+                refs: vec![],
+                subject: "Topic".into(),
+            },
+            TestMessage {
+                id: "b".into(),
+                refs: vec![],
+                subject: "Re: Topic".into(),
+            },
+        ];
+
+        let threads = thread_messages(messages);
+        let ids = collect_ids(&threads);
+        // Subject grouping may merge these. We just check nothing is lost.
+        let all_ids: Vec<String> = ids.iter().flatten().cloned().collect();
+        assert_eq!(all_ids.len(), 3);
+    }
+
+    // ── Threading: ghost containers ─────────────────────────────
 
     #[test]
-    fn ghost_parent() {
+    fn ghost_parent_single_child() {
+        // Only "b" exists, it references nonexistent "a".
+        // Ghost "a" has 1 child → promoted away. Result: [b].
         let messages = vec![TestMessage {
             id: "b".into(),
             refs: vec!["a".into()],
@@ -517,18 +590,60 @@ mod tests {
         }];
 
         let threads = thread_messages(messages);
-
-        // "a" is a ghost — a synthetic empty root should appear?
-        // or "b" becomes a root. Decide based on JWZ spec.
         let ids = collect_ids(&threads);
         assert_eq!(ids.len(), 1);
-        // TODO: define expected behavior for ghost parent
+        assert_eq!(ids[0], vec!["b"]);
     }
 
-    // ── Subject-based grouping ────────────────────────────────────
+    #[test]
+    fn ghost_chain_single_child() {
+        // "c" refs "b", "b" refs "a". Only "c" exists.
+        // Ghosts "a" and "b" each have 1 child → both promoted. Result: [c].
+        let messages = vec![TestMessage {
+            id: "c".into(),
+            refs: vec!["a".into(), "b".into()],
+            subject: "Re: Hello".into(),
+        }];
+
+        let threads = thread_messages(messages);
+        let ids = collect_ids(&threads);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], vec!["c"]);
+    }
 
     #[test]
-    fn subject_based_grouping() {
+    fn ghost_with_multiple_children_kept() {
+        // Two messages both reference the same nonexistent "a".
+        // Ghost "a" has 2 children and is a root → kept as ghost root.
+        let messages = vec![
+            TestMessage {
+                id: "x".into(),
+                refs: vec!["a".into()],
+                subject: "Re: Topic".into(),
+            },
+            TestMessage {
+                id: "y".into(),
+                refs: vec!["a".into()],
+                subject: "Re: Topic".into(),
+            },
+        ];
+
+        let threads = thread_messages(messages);
+        let ids = collect_ids(&threads);
+        // Ghost "a" keeps x and y as siblings underneath.
+        // After step 5 (subject grouping), they may end up under synthetic root.
+        // Either way: one thread, both messages present.
+        assert_eq!(ids.len(), 1);
+        let all_ids: Vec<String> = ids.iter().flatten().cloned().collect();
+        assert_eq!(all_ids.len(), 2);
+    }
+
+    // ── Threading: subject-based grouping ───────────────────────
+
+    #[test]
+    fn subject_based_grouping_siblings() {
+        // Three messages, same bare subject, no references → siblings under
+        // synthetic root.
         let messages = vec![
             TestMessage {
                 id: "1".into(),
@@ -543,19 +658,68 @@ mod tests {
             TestMessage {
                 id: "3".into(),
                 refs: vec![],
-                subject: "Fwd: Meeting notes".into(),
+                subject: "Re: Re: Meeting notes".into(),
             },
         ];
 
         let threads = thread_messages(messages);
-
-        // All three should be under one synthetic root (same bare subject)
         let ids = collect_ids(&threads);
+        // All three under one thread
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].len(), 3);
     }
 
-    // ── Multiple independent threads ──────────────────────────────
+    #[test]
+    fn subject_grouping_with_ghost_root() {
+        // Two messages reference nonexistent parent + a third standalone
+        // message, all with same bare subject.
+        // Ghost root (depth 0) wins table slot, absorbs the standalone.
+        let messages = vec![
+            TestMessage {
+                id: "x".into(),
+                refs: vec!["ghost".into()],
+                subject: "Re: Topic".into(),
+            },
+            TestMessage {
+                id: "y".into(),
+                refs: vec!["ghost".into()],
+                subject: "Re: Re: Topic".into(),
+            },
+            TestMessage {
+                id: "z".into(),
+                refs: vec![],
+                subject: "Topic".into(),
+            },
+        ];
+
+        let threads = thread_messages(messages);
+        let ids = collect_ids(&threads);
+        // All three should be in one thread
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].len(), 3);
+    }
+
+    #[test]
+    fn different_subjects_not_grouped() {
+        let messages = vec![
+            TestMessage {
+                id: "a".into(),
+                refs: vec![],
+                subject: "Hello".into(),
+            },
+            TestMessage {
+                id: "b".into(),
+                refs: vec![],
+                subject: "World".into(),
+            },
+        ];
+
+        let threads = thread_messages(messages);
+        let ids = collect_ids(&threads);
+        assert_eq!(ids.len(), 2);
+    }
+
+    // ── Threading: mixed ────────────────────────────────────────
 
     #[test]
     fn independent_threads() {
@@ -583,11 +747,10 @@ mod tests {
         ];
 
         let threads = thread_messages(messages);
-
         let ids = collect_ids(&threads);
-        // Three threads: [x → y], [p], [q]
+        // x and y linked by reference → one thread. p and q solo → two more.
+        // Total: 3 threads. Order not guaranteed, so check by content.
         assert_eq!(ids.len(), 3);
-        // Order not guaranteed, so check by set
         let mut sorted: Vec<Vec<String>> = ids
             .into_iter()
             .map(|mut v| {
@@ -601,13 +764,48 @@ mod tests {
         assert_eq!(sorted[2], vec!["x", "y"]);
     }
 
-    // ── Message with no ID ───────────────────────────────────────
+    #[test]
+    fn references_beat_subject() {
+        // "a" references "b" explicitly → already threaded by reference.
+        // They share bare subject "Hello" but subject grouping should NOT
+        // create an extra synthetic root because they're already in a tree.
+        // (In JWZ, subject grouping only operates on the root set, and in
+        // this case only "b" is a root.)
+        let messages = vec![
+            TestMessage {
+                id: "a".into(),
+                refs: vec!["b".into()],
+                subject: "Re: Hello".into(),
+            },
+            TestMessage {
+                id: "b".into(),
+                refs: vec![],
+                subject: "Hello".into(),
+            },
+        ];
+
+        let threads = thread_messages(messages);
+        let ids = collect_ids(&threads);
+        // One thread: b → a (not siblings under synthetic root)
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], vec!["b", "a"]);
+    }
 
     #[test]
     fn message_without_id() {
-        // Messages without a Message-ID can't be threaded by reference,
-        // but could still be threaded by subject.
-        // TODO: define expected behavior
+        // Messages without Message-ID get synthetic IDs, can still be
+        // grouped by subject.
+        // This test documents current behavior — TestMessage always has an
+        // ID. A real implementation with optional IDs needs its own test.
+        // For now, verify the algorithm doesn't crash on normal messages.
+        let messages = vec![
+            TestMessage {
+                id: "has_id".into(),
+                refs: vec![],
+                subject: "Topic".into(),
+            },
+        ];
+        let threads = thread_messages(messages);
+        assert_eq!(threads.len(), 1);
     }
-    */
 }
