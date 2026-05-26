@@ -7,6 +7,7 @@
 //! - `References` + `In-Reply-To` headers (parent links)
 //! - `Subject` fallback (bare subject, stripped of "Re:", "Fwd:", etc.)
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// Minimal data the threading algorithm needs from each message.
@@ -124,10 +125,9 @@ fn build_thread_subtree<T: Message>(
     }
 }
 
-/// Strip leading "re:", "re[4]:" (case-insensitive)
-/// May return empty string if nothing else remains in the subject line
-fn bare_subject(raw: &str) -> String {
+fn _bare_subject(raw: &str) -> (String, usize) {
     let mut s = raw.trim().to_string();
+    let mut depth = 0;
     loop {
         let trimmed = s.trim_start();
         let lower = trimmed.to_lowercase();
@@ -137,11 +137,124 @@ fn bare_subject(raw: &str) -> String {
             x[close..].strip_prefix("]:")
         });
         match rest {
-            Some(r) => s = trimmed[trimmed.len() - r.len()..].trim().to_string(),
+            Some(r) => {
+                depth += 1;
+                s = trimmed[trimmed.len() - r.len()..].trim().to_string();
+            }
             None => break,
         }
     }
-    s
+    (s, depth)
+}
+
+/// Strip leading "re:", "re[4]:" (case-insensitive)
+/// May return empty string if nothing else remains in the subject line
+fn bare_subject(raw: &str) -> String {
+    let (s, _) = _bare_subject(raw);
+    return s;
+}
+
+/// Find first occurrence of a message in subtree and extract its subject
+fn subtree_subject<T: Message>(node: &ThreadNode<T>) -> Option<String> {
+    if let Some(ref msg) = node.message {
+        msg.subject().map(|s| s.to_string())
+    } else {
+        node.children
+            .iter()
+            .find_map(|child| subtree_subject(child))
+    }
+}
+
+fn re_depth(subject: &str) -> usize {
+    let (_, depth) = _bare_subject(subject);
+    depth
+}
+
+fn subject_re_order<T: Message>(a: &ThreadNode<T>, b: &ThreadNode<T>) -> Ordering {
+    match (a.message.as_ref(), b.message.as_ref()) {
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+        (Some(amsg), Some(bmsg)) => {
+            let a_d = re_depth(amsg.subject().unwrap_or(""));
+            let b_d = re_depth(bmsg.subject().unwrap_or(""));
+            a_d.cmp(&b_d)
+        }
+    }
+}
+
+fn group_by_subject<T: Message>(threads: Vec<ThreadNode<T>>) -> Vec<ThreadNode<T>> {
+    let mut subject_table: HashMap<String, ThreadNode<T>> = HashMap::new();
+    let mut orphans: Vec<ThreadNode<T>> = Vec::new(); // no subject -> pass-through
+
+    for node in threads {
+        let bare = match subtree_subject(&node) {
+            Some(s) => bare_subject(&s),
+            None => {
+                orphans.push(node);
+                continue;
+            }
+        };
+        if bare.is_empty() {
+            orphans.push(node);
+            continue;
+        }
+
+        match subject_table.remove(&bare) {
+            None => {
+                subject_table.insert(bare, node);
+            }
+            Some(existing) => {
+                let (winner, loser) = match subject_re_order(&node, &existing) {
+                    Ordering::Less => (node, existing),
+                    _ => (existing, node),
+                };
+                subject_table.insert(bare, merge_threads(winner, loser));
+            }
+        }
+    }
+
+    subject_table.into_values().chain(orphans).collect()
+}
+
+fn merge_threads<T: Message>(winner: ThreadNode<T>, loser: ThreadNode<T>) -> ThreadNode<T> {
+    match (winner.message.is_none(), loser.message.is_none()) {
+        // Both empty → merge children into winner
+        (true, true) => {
+            let mut winner = winner;
+            winner.children.extend(loser.children);
+            winner
+        }
+        // Winner is ghost, loser is real → real becomes child of ghost
+        (true, false) => {
+            let mut winner = winner;
+            winner.children.push(loser);
+            winner
+        }
+        // Both real → siblings under a synthetic empty root
+        (false, false) => ThreadNode {
+            message: None,
+            children: vec![winner, loser],
+        },
+        // Loser is ghost, winner is real — shouldn't happen, but handle gracefully
+        (false, true) => {
+            let mut loser = loser;
+            loser.children.push(winner);
+            loser
+        }
+    }
+}
+
+fn finalize<T: Message>(nodes: Vec<ThreadNode<T>>) -> Vec<Thread<T>> {
+    nodes
+        .into_iter()
+        .filter_map(|node| {
+            node.message.map(|msg| Thread {
+                message: msg,
+                children: finalize(node.children),
+            })
+        })
+        .collect()
 }
 
 /// Run the JWZ threading algorithm on an unordered collection of messages.
@@ -232,7 +345,7 @@ pub fn thread_messages<T: Message>(messages: impl IntoIterator<Item = T>) -> Vec
     //  Removing a container:
     //  remove parent.children ref
     //  re-parent all its children to ITS parent
-    let mut threads: Vec<ThreadNode<T>> = cs_roots
+    let threads: Vec<ThreadNode<T>> = cs_roots
         .into_iter()
         .flat_map(|idx| build_thread_subtree(idx, &mut cs))
         .collect();
@@ -242,9 +355,10 @@ pub fn thread_messages<T: Message>(messages: impl IntoIterator<Item = T>) -> Vec
     drop(cs);
 
     // Step 5 - Group root set by subject
-    // Step 6 - DONE (can discard .parent field of container)
-    // Step 7(!) - SORT siblings (by whatever you want)
-    todo!("convert ThreadNode's to Thread's, return")
+    let threads = group_by_subject(threads);
+
+    // Step 6 - Convert ThreadNode → Thread (all messages should be Some by now)
+    finalize(threads)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
