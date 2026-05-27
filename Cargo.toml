@@ -4,6 +4,7 @@ members = [
     "crates/loreread-lua",
     "crates/loreread-gtk",
     "tools/maildir-index",
+    "tools/query-test",
     "tools/thread-test",
 ]
 resolver = "3"

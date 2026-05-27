@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 rusqlite = { version = "0.39", features = ["bundled"] }
 mail-parser = "0.10"
+nom = "7"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
