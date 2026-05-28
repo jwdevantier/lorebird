@@ -1,0 +1,496 @@
+//! Main application window — Thunderbird-style tri-pane layout.
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │ [HeaderBar]  "loreread"            [Fetch] [Index]      │
+//! ├──────────┬─────────────────────┬────────────────────────┤
+//! │ Sidebar  │ [Search bar       ] │  From: alice@…         │
+//! │          │ ┌─────────────────┐ │  To:   linux-kernel@…  │
+//! │ lore     │ │ Subject│From│Dt │ │  Subject: [PATCH] …    │
+//! │  Inbox   │ │► [PATC │Ali │2h │ │  Date: 2h ago          │
+//! │  Sent    │ │  └ Re: │Bob │1h │ │  ────────────────────  │
+//! │  Drafts  │ │► Buil… │Eve │3d │ │  Body of the email     │
+//! │ ──────   │ │  └ Re: │Fr  │2d │ │  goes here…            │
+//! │ work     │ │  └ Re: │Gr  │ 1d│ │                        │
+//! │  Inbox   │ └────────┴────┴───┘ │                        │
+//! ├──────────┴─────────────────────┴────────────────────────┤
+//! │ Ready                                                   │
+//! └─────────────────────────────────────────────────────────┘
+//! ```
+
+use glib::Object;
+use gtk4::prelude::*;
+use gtk4::{
+    Application, ApplicationWindow, Box, ColumnView, ColumnViewColumn, Grid, HeaderBar, IconSize,
+    Image, Label, ListBox, ListBoxRow, ListItem, Orientation, Paned, PolicyType, SearchEntry,
+    SelectionMode, Separator, ScrolledWindow, SignalListItemFactory, SingleSelection,
+    TextBuffer, TextView, TreeExpander, TreeListModel, TreeListRow, WrapMode,
+};
+
+use crate::thread_node::ThreadNode;
+
+// ── Public entry point ─────────────────────────────────────────────
+
+/// Build and present the main loreread window.
+pub fn build_window(app: &Application) {
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("loreread")
+        .default_width(1200)
+        .default_height(700)
+        .build();
+
+    // ── Header bar ────────────────────────────────────────────
+    let header = HeaderBar::new();
+    let title_label = Label::new(Some("loreread"));
+    title_label.add_css_class("title");
+    header.set_title_widget(Some(&title_label));
+
+    let fetch_btn = gtk4::Button::with_label("Fetch");
+    let index_btn = gtk4::Button::with_label("Index");
+    header.pack_end(&index_btn);
+    header.pack_end(&fetch_btn);
+    window.set_titlebar(Some(&header));
+
+    // ── Main vertical box: paned + status ──────────────────────
+    let main_vbox = Box::new(Orientation::Vertical, 0);
+
+    // ── Tri-pane: sidebar | center | preview ──────────────────
+    let outer_paned = Paned::new(Orientation::Horizontal);
+    let inner_paned = Paned::new(Orientation::Horizontal);
+
+    // Sidebar
+    let sidebar = build_sidebar();
+    outer_paned.set_start_child(Some(&sidebar));
+    outer_paned.set_shrink_start_child(false);
+
+    // Center + preview (and wiring)
+    let (center, selection, preview_labels) = build_center_pane();
+    inner_paned.set_start_child(Some(&center));
+    inner_paned.set_shrink_start_child(false);
+
+    let preview = build_preview_pane(&preview_labels);
+    inner_paned.set_end_child(Some(&preview));
+    inner_paned.set_shrink_end_child(false);
+    inner_paned.set_position(550);
+
+    outer_paned.set_end_child(Some(&inner_paned));
+    outer_paned.set_position(180);
+    outer_paned.set_vexpand(true);
+    outer_paned.set_hexpand(true);
+
+    // ── Status bar ────────────────────────────────────────────
+    let status_label = Label::new(Some("Ready"));
+    status_label.set_margin_start(8);
+    status_label.set_margin_top(4);
+    status_label.set_margin_bottom(4);
+    status_label.add_css_class("dim-label");
+    status_label.add_css_class("caption");
+
+    main_vbox.append(&outer_paned);
+    main_vbox.append(&status_label);
+    window.set_child(Some(&main_vbox));
+
+    // ── Wire selection → preview ──────────────────────────────
+    let pl = preview_labels;
+    selection.connect_selection_changed(move |sel, _pos, _n| {
+        if let Some(obj) = sel.selected_item()
+            && let Some(row) = obj.downcast_ref::<TreeListRow>()
+                && let Some(node) = row.item().and_then(|i| i.downcast::<ThreadNode>().ok()) {
+                    pl.from_label.set_text(&node.sender());
+                    pl.subject_label.set_text(&node.subject());
+                    pl.date_label.set_text(&node.date());
+                    pl.body_buffer.set_text(&node.body_preview());
+                    return;
+                }
+        pl.from_label.set_text("");
+        pl.subject_label.set_text("");
+        pl.date_label.set_text("");
+        pl.body_buffer.set_text("");
+    });
+
+    window.present();
+}
+
+// ── Sidebar ───────────────────────────────────────────────────────
+
+fn build_sidebar() -> ScrolledWindow {
+    let scrolled = ScrolledWindow::new();
+    scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
+    scrolled.set_min_content_width(160);
+
+    let list_box = ListBox::new();
+    list_box.set_selection_mode(SelectionMode::Single);
+    list_box.add_css_class("navigation-sidebar");
+
+    // Sample data — will eventually come from Lua config
+    let entries: &[(&str, &str, u32, bool)] = &[
+        ("lore.kernel.org", "network-workgroup", 0, true),
+        ("Inbox", "mail-mailbox", 42, false),
+        ("Sent", "mail-sent", 0, false),
+        ("Drafts", "mail-message-new", 3, false),
+        ("Archive", "mail-archive", 0, false),
+        ("Trash", "user-trash", 0, false),
+        ("──────────", "", 0, true), // visual separator
+        ("work mailing list", "network-workgroup", 0, true),
+        ("Inbox", "mail-mailbox", 128, false),
+        ("Sent", "mail-sent", 0, false),
+        ("Trash", "user-trash", 5, false),
+    ];
+
+    for &(name, icon, count, is_header) in entries {
+        if is_header && icon.is_empty() {
+            let sep = Separator::new(Orientation::Horizontal);
+            sep.set_margin_top(4);
+            sep.set_margin_bottom(4);
+            let row = ListBoxRow::new();
+            row.set_child(Some(&sep));
+            row.set_selectable(false);
+            row.set_activatable(false);
+            list_box.append(&row);
+            continue;
+        }
+
+        let hbox = Box::new(Orientation::Horizontal, 6);
+        hbox.set_margin_top(4);
+        hbox.set_margin_bottom(4);
+        hbox.set_margin_start(8);
+        hbox.set_margin_end(8);
+
+        if !icon.is_empty() {
+            let img = Image::from_icon_name(icon);
+            img.set_icon_size(IconSize::Normal);
+            hbox.append(&img);
+        }
+
+        let label = Label::new(Some(name));
+        label.set_hexpand(true);
+        label.set_xalign(0.0);
+        if is_header {
+            label.add_css_class("heading");
+            label.add_css_class("caption");
+        }
+        hbox.append(&label);
+
+        if count > 0 {
+            let count_lbl = Label::new(Some(&count.to_string()));
+            count_lbl.add_css_class("dim-label");
+            count_lbl.add_css_class("caption");
+            hbox.append(&count_lbl);
+        }
+
+        let row = ListBoxRow::new();
+        row.set_child(Some(&hbox));
+        if is_header {
+            row.set_selectable(false);
+            row.set_activatable(false);
+        }
+        list_box.append(&row);
+    }
+
+    scrolled.set_child(Some(&list_box));
+    scrolled
+}
+
+// ── Center pane ───────────────────────────────────────────────────
+
+/// Labels in the preview pane that need to be updated on selection change.
+pub(crate) struct PreviewLabels {
+    pub from_label: Label,
+    pub subject_label: Label,
+    pub date_label: Label,
+    pub body_buffer: TextBuffer,
+}
+
+/// Build the centre pane, returning the root widget, the selection model
+/// (for wiring to the preview), and the preview labels.
+fn build_center_pane() -> (Box, SingleSelection, PreviewLabels) {
+    let vbox = Box::new(Orientation::Vertical, 0);
+
+    // ── Search bar ────────────────────────────────────────────
+    let search = SearchEntry::new();
+    search.set_hexpand(true);
+    search.set_placeholder_text(Some("Search mail…"));
+    search.set_margin_top(6);
+    search.set_margin_bottom(6);
+    search.set_margin_start(8);
+    search.set_margin_end(8);
+    vbox.append(&search);
+
+    // ── Thread list ──────────────────────────────────────────
+    let (column_view, selection) = build_thread_list();
+
+    let scrolled = ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_hexpand(true);
+    scrolled.set_child(Some(&column_view));
+    vbox.append(&scrolled);
+
+    // ── Preview labels (updated on selection) ────────────────
+    let from_label = Label::new(Some("alice@example.com"));
+    from_label.set_xalign(0.0);
+    let subject_label = Label::new(Some("[PATCH v2] Fix memory leak"));
+    subject_label.set_xalign(0.0);
+    let date_label = Label::new(Some("2h ago"));
+    date_label.set_xalign(0.0);
+    let body_buffer = TextBuffer::new(None);
+    body_buffer.set_text("Select a message to preview it here.");
+
+    let preview_labels = PreviewLabels {
+        from_label,
+        subject_label,
+        date_label,
+        body_buffer,
+    };
+
+    (vbox, selection, preview_labels)
+}
+
+// ── Thread list (ColumnView + TreeListModel) ──────────────────────
+
+fn build_thread_list() -> (ColumnView, SingleSelection) {
+    // ── Sample data ──────────────────────────────────────────
+    let mut root_model = gio::ListStore::new::<ThreadNode>();
+
+    // Thread 1: a patch with two replies
+    let t1 = ThreadNode::new(
+        "[PATCH v2] Fix memory leak in subsystem",
+        "alice@example.com",
+        "2h ago",
+    );
+    t1.set_body_preview(
+        "This patch fixes a memory leak that occurs when\n\
+         the subsystem is initialized multiple times\n\
+         without proper cleanup.\n\n\
+         Signed-off-by: Alice <alice@example.com>",
+    );
+    let t1r1 = ThreadNode::new(
+        "Re: [PATCH v2] Fix memory leak in subsystem",
+        "bob@example.com",
+        "1h ago",
+    );
+    t1r1.set_body_preview("Looks good to me.\n\nReviewed-by: Bob <bob@example.com>");
+    let t1r2 = ThreadNode::new(
+        "Re: [PATCH v2] Fix memory leak in subsystem",
+        "carol@example.com",
+        "30m ago",
+    );
+    t1r2.set_body_preview("Applied, thanks everyone!");
+    t1.add_child(&t1r1);
+    t1.add_child(&t1r2);
+
+    // Thread 2: RFC, no replies
+    let t2 = ThreadNode::new(
+        "[RFC] New API for device configuration",
+        "dave@example.com",
+        "1d ago",
+    );
+    t2.set_body_preview(
+        "This RFC proposes a new API for configuring\n\
+         devices. The current approach has several\n\
+         shortcomings that this aims to address.\n\n\
+         Thoughts?",
+    );
+
+    // Thread 3: deep thread
+    let t3 = ThreadNode::new("Build failure on ARM64", "eve@example.com", "3d ago");
+    t3.set_body_preview("I'm seeing a build failure on ARM64 when…");
+    let t3r1 = ThreadNode::new("Re: Build failure on ARM64", "frank@example.com", "2d ago");
+    t3r1.set_body_preview("I can reproduce this. It seems related to…");
+    let t3r1r1 = ThreadNode::new("Re: Build failure on ARM64", "grace@example.com", "2d ago");
+    t3r1r1.set_body_preview("This should be fixed by commit abc123…");
+    let t3r1r1r1 =
+        ThreadNode::new("Re: Build failure on ARM64", "eve@example.com", "1d ago");
+    t3r1r1r1.set_body_preview("Confirmed, the fix works. Thanks!");
+    t3.add_child(&t3r1);
+    t3r1.add_child(&t3r1r1);
+    t3r1r1.add_child(&t3r1r1r1);
+
+    // Thread 4: standalone
+    let t4 = ThreadNode::new("Weekly status report", "heidi@example.com", "1w ago");
+    t4.set_body_preview("Weekly status report for the week ending…\n\n- Item 1\n- Item 2");
+
+    root_model.extend([&t1, &t2, &t3, &t4]);
+
+    // ── TreeListModel ────────────────────────────────────────
+    let tree_model = TreeListModel::new(
+        root_model, // consumed — tree model keeps it alive
+        false,      // passthrough=false → items are TreeListRow
+        true,       // autoexpand
+        |item: &Object| -> Option<gio::ListModel> {
+            let node = item.downcast_ref::<ThreadNode>()?;
+            let children = node.children_store();
+            if children.n_items() > 0 {
+                Some(children.clone().upcast())
+            } else {
+                None
+            }
+        },
+    );
+
+    // ── Selection ───────────────────────────────────────────
+    let selection = SingleSelection::new(Some(tree_model));
+    selection.set_can_unselect(true);
+
+    // ── Column view ─────────────────────────────────────────
+    let column_view = ColumnView::new(Some(selection.clone()));
+    column_view.set_vexpand(true);
+    column_view.set_hexpand(true);
+
+    // — Column: Subject (with tree expander) ─────────────────
+    let subject_factory = SignalListItemFactory::new();
+    subject_factory.connect_setup(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().unwrap();
+        let expander = TreeExpander::new();
+        let label = Label::new(None);
+        label.set_xalign(0.0);
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        expander.set_child(Some(&label));
+        list_item.set_child(Some(&expander));
+    });
+    subject_factory.connect_bind(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().unwrap();
+        let row = list_item
+            .item()
+            .and_downcast::<TreeListRow>()
+            .unwrap();
+        let expander = list_item
+            .child()
+            .and_downcast::<TreeExpander>()
+            .unwrap();
+        expander.set_list_row(Some(&row));
+        if let Some(node) = row.item().and_downcast::<ThreadNode>()
+            && let Some(label) = expander.child().and_downcast::<Label>() {
+                label.set_label(&node.subject());
+            }
+    });
+
+    let subject_col =
+        ColumnViewColumn::new(Some("Subject"), Some(subject_factory));
+    subject_col.set_expand(true);
+    column_view.append_column(&subject_col);
+
+    // — Column: From ──────────────────────────────────────────
+    let from_factory = SignalListItemFactory::new();
+    from_factory.connect_setup(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().unwrap();
+        let label = Label::new(None);
+        label.set_xalign(0.0);
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        label.set_width_chars(18);
+        label.add_css_class("dim-label");
+        list_item.set_child(Some(&label));
+    });
+    from_factory.connect_bind(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().unwrap();
+        let row = list_item
+            .item()
+            .and_downcast::<TreeListRow>()
+            .unwrap();
+        if let Some(node) = row.item().and_downcast::<ThreadNode>()
+            && let Some(label) = list_item.child().and_downcast::<Label>() {
+                label.set_label(&node.sender());
+            }
+    });
+
+    let from_col = ColumnViewColumn::new(Some("From"), Some(from_factory));
+    column_view.append_column(&from_col);
+
+    // — Column: Date ──────────────────────────────────────────
+    let date_factory = SignalListItemFactory::new();
+    date_factory.connect_setup(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().unwrap();
+        let label = Label::new(None);
+        label.set_xalign(1.0);
+        label.set_width_chars(8);
+        label.add_css_class("dim-label");
+        label.add_css_class("numeric");
+        list_item.set_child(Some(&label));
+    });
+    date_factory.connect_bind(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().unwrap();
+        let row = list_item
+            .item()
+            .and_downcast::<TreeListRow>()
+            .unwrap();
+        if let Some(node) = row.item().and_downcast::<ThreadNode>()
+            && let Some(label) = list_item.child().and_downcast::<Label>() {
+                label.set_label(&node.date());
+            }
+    });
+
+    let date_col = ColumnViewColumn::new(Some("Date"), Some(date_factory));
+    date_col.set_resizable(false);
+    column_view.append_column(&date_col);
+
+    // No column sorting — tree order comes from JWZ threading
+
+    (column_view, selection)
+}
+
+// ── Preview pane ──────────────────────────────────────────────────
+
+fn build_preview_pane(labels: &PreviewLabels) -> Box {
+    let vbox = Box::new(Orientation::Vertical, 0);
+    vbox.set_margin_top(8);
+    vbox.set_margin_bottom(8);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    // ── Headers ──────────────────────────────────────────────
+    let headers = Grid::new();
+    headers.set_column_spacing(12);
+    headers.set_row_spacing(4);
+    headers.set_margin_bottom(8);
+
+    let add_row = |grid: &Grid, row: i32, key: &str, value: &Label| {
+        let k = make_header_key(key);
+        grid.attach(&k, 0, row, 1, 1);
+        let v = value.clone();
+        v.set_hexpand(true);
+        v.set_xalign(0.0);
+        v.set_selectable(true);
+        grid.attach(&v, 1, row, 1, 1);
+    };
+
+    add_row(&headers, 0, "From", &labels.from_label);
+    let to_label = Label::new(Some("linux-kernel@vger.kernel.org"));
+    to_label.set_xalign(0.0);
+    add_row(&headers, 1, "To", &to_label);
+    add_row(&headers, 2, "Subject", &labels.subject_label);
+    add_row(&headers, 3, "Date", &labels.date_label);
+
+    vbox.append(&headers);
+
+    // ── Separator ────────────────────────────────────────────
+    let sep = Separator::new(Orientation::Horizontal);
+    vbox.append(&sep);
+
+    // ── Body ─────────────────────────────────────────────────
+    let scrolled = ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_hexpand(true);
+    scrolled.set_policy(PolicyType::Automatic, PolicyType::Automatic);
+
+    let body_view = TextView::with_buffer(&labels.body_buffer);
+    body_view.set_editable(false);
+    body_view.set_cursor_visible(false);
+    body_view.set_wrap_mode(WrapMode::WordChar);
+    body_view.set_left_margin(4);
+    body_view.set_right_margin(4);
+    body_view.set_top_margin(4);
+    body_view.set_bottom_margin(4);
+
+    scrolled.set_child(Some(&body_view));
+    vbox.append(&scrolled);
+
+    vbox
+}
+
+/// Create a bold, right-aligned header key label (e.g. "From:").
+fn make_header_key(text: &str) -> Label {
+    let label = Label::new(Some(text));
+    label.set_xalign(1.0);
+    label.add_css_class("dim-label");
+    label
+}

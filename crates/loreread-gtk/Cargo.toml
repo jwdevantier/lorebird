@@ -9,5 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 gtk4 = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+glib = { version = "0.20", features = ["v2_74"] }
+gio = "0.20"
 loreread-core = { path = "../loreread-core" }
 loreread-lua = { path = "../loreread-lua" }
