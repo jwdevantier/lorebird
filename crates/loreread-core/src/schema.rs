@@ -1,7 +1,11 @@
 //! SQLite schema and migrations for the mail index.
 //!
-//! Defines tables for message metadata, an FTS5 virtual table for full-text
-//! search, and triggers to keep them in sync.
+//! Two tables:
+//! - `mail_ndx` — ordinary table: message metadata for threading and file
+//!   location.  Inserted incrementally as new mail arrives.
+//! - `mail_fts` — standalone FTS5 virtual table: full-text search across
+//!   subject, body, addresses, and date.  No `content=` / no triggers —
+//!   rows are inserted directly by the indexer.
 
 use rusqlite::{Connection, Result as SqlResult};
 
@@ -10,55 +14,30 @@ use rusqlite::{Connection, Result as SqlResult};
 /// Idempotent — safe to call on an existing database.
 pub fn init_db(conn: &Connection) -> SqlResult<()> {
     conn.execute_batch(
-        "
-        -- message metadata
-        CREATE TABLE IF NOT EXISTS messages (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id TEXT UNIQUE NOT NULL,
-            subject    TEXT,
-            from_addr  TEXT,
-            date_str   TEXT,
-            date_ts    INTEGER,          -- unix epoch, for sorting
-            path       TEXT NOT NULL,     -- relative path inside the maildir
-            indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
-            size       INTEGER
+        "\
+        -- message metadata for threading and file location
+        CREATE TABLE IF NOT EXISTS mail_ndx (
+            message_id  TEXT PRIMARY KEY,
+            refs         TEXT,   -- space-separated Message-IDs (In-Reply-To appended)
+            subject     TEXT,
+            date        TEXT,          -- from Date: header, display only
+            received_ts INTEGER,       -- from Received: header, Unix epoch
+            filename    TEXT NOT NULL  -- path relative to maildir root (base name, no flags)
         );
 
-        -- normalised references for threading (ordered list)
-        CREATE TABLE IF NOT EXISTS refs (
-            message_id TEXT NOT NULL,
-            ref_id     TEXT NOT NULL,
-            seq        INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (message_id, ref_id),
-            FOREIGN KEY (message_id) REFERENCES messages(message_id)
-        );
+        CREATE INDEX IF NOT EXISTS idx_mail_ndx_received_ts
+            ON mail_ndx(received_ts);
 
-        -- FTS5 index over subject, from, and body
-        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        -- standalone FTS5 index (no content=, no triggers)
+        CREATE VIRTUAL TABLE IF NOT EXISTS mail_fts USING fts5(
+            message_id,
+            date,       -- from Date: header
+            \"from\",
             subject,
-            from_addr,
-            body,
-            content=messages,
-            content_rowid=id
+            \"to\",
+            cc,
+            body
         );
-
-        -- triggers to keep FTS in sync
-        CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, subject, from_addr, body)
-            VALUES (new.id, new.subject, new.from_addr, '');
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, subject, from_addr, body)
-            VALUES ('delete', old.id, old.subject, old.from_addr, '');
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, subject, from_addr, body)
-            VALUES ('delete', old.id, old.subject, old.from_addr, '');
-            INSERT INTO messages_fts(rowid, subject, from_addr, body)
-            VALUES (new.id, new.subject, new.from_addr, '');
-        END;
         ",
     )?;
 
@@ -67,7 +46,7 @@ pub fn init_db(conn: &Connection) -> SqlResult<()> {
 
 /// Return the count of messages currently in the database.
 pub fn message_count(conn: &Connection) -> SqlResult<i64> {
-    conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+    conn.query_row("SELECT COUNT(*) FROM mail_ndx", [], |r| r.get(0))
 }
 
 #[cfg(test)]

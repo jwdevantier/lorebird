@@ -10,6 +10,15 @@ use std::path::Path;
 use crate::message::MailMessage;
 use crate::schema;
 
+/// Strip maildir flags from a filename, leaving the stable base name.
+///
+/// Maildir filenames look like `1700000000.M123P456.host:2,S`.
+/// Everything after `:2` (the flags suffix) can change over time;
+/// the part before `:2` is the stable identifier.
+fn stable_basename(filename: &str) -> &str {
+    filename.split(":2").next().unwrap_or(filename)
+}
+
 /// Recursively collect all regular files under `dir`, skipping dotfiles.
 fn collect_mail_files(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
@@ -35,7 +44,10 @@ fn collect_mail_files(dir: &Path) -> Vec<std::path::PathBuf> {
 
 /// Index every message in `maildir_path`, inserting rows into `conn`.
 ///
-/// Skips messages whose `Message-ID` is already present in the database.
+/// Identifies new messages by comparing the stable base filename (flags
+/// stripped) against the `filename` column in `mail_ndx`.  The mail fetcher
+/// is expected to guarantee stable base filenames and to only write new
+/// mail to disk, so a missing base name means unindexed mail.
 ///
 /// Returns the number of newly inserted messages.
 pub fn index_maildir(conn: &Connection, maildir_path: &Path) -> SqlResult<usize> {
@@ -49,6 +61,34 @@ pub fn index_maildir(conn: &Connection, maildir_path: &Path) -> SqlResult<usize>
             continue;
         }
         for file_path in collect_mail_files(&dir) {
+            let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let base = stable_basename(file_name);
+
+            // Build relative path using the stable base name (no flags).
+            // The fetcher may later update flags, but the base name stays
+            // the same — we won't re-index.
+            let rel_path = file_path
+                .with_file_name(base)
+                .strip_prefix(maildir_path)
+                .unwrap_or(&file_path)
+                .to_string_lossy()
+                .to_string();
+
+            // Skip if already indexed
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM mail_ndx WHERE filename = ?1",
+                    params![rel_path],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+
+            if exists {
+                continue;
+            }
+
             let raw = match std::fs::read(&file_path) {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -62,50 +102,36 @@ pub fn index_maildir(conn: &Connection, maildir_path: &Path) -> SqlResult<usize>
                 continue;
             };
 
-            // Skip if already indexed
-            let exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM messages WHERE message_id = ?1",
-                    params![msg_id],
-                    |r| r.get(0),
-                )
-                .unwrap_or(false);
+            let refs = msg.references.join(" ");
 
-            if exists {
-                continue;
-            }
-
-            let rel_path = file_path
-                .strip_prefix(maildir_path)
-                .unwrap_or(&file_path)
-                .to_string_lossy()
-                .to_string();
-
-            let size: Option<i64> = std::fs::metadata(&file_path)
-                .ok()
-                .map(|m| m.len() as i64);
-
+            // ── mail_ndx: metadata for threading & file location ──
             conn.execute(
-                "INSERT INTO messages (message_id, subject, from_addr, date_str, date_ts, path, size)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO mail_ndx (message_id, refs, subject, date, received_ts, filename)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     msg_id,
+                    refs,
                     msg.subject,
-                    msg.from_addr,
                     msg.date_rfc3339,
-                    msg.date_ts,
+                    msg.received_ts,
                     rel_path,
-                    size,
                 ],
             )?;
 
-            // Insert references (for threading)
-            for (seq, ref_id) in msg.references.iter().enumerate() {
-                conn.execute(
-                    "INSERT OR IGNORE INTO refs (message_id, ref_id, seq) VALUES (?1, ?2, ?3)",
-                    params![msg_id, ref_id, seq as i64],
-                )?;
-            }
+            // ── mail_fts: full-text search ──
+            conn.execute(
+                "INSERT INTO mail_fts (message_id, date, \"from\", subject, \"to\", cc, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    msg_id,
+                    msg.date_rfc3339,
+                    msg.from_addr,
+                    msg.subject,
+                    msg.to_addr,
+                    msg.cc_addr,
+                    msg.body_text,
+                ],
+            )?;
 
             inserted += 1;
         }
