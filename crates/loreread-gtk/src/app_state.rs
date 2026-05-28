@@ -160,10 +160,6 @@ impl AppState {
         *self.active_query.borrow_mut() = Some(query);
     }
 
-    /// Clear the view filter (show all mail for the active profile).
-    pub fn clear_view(&self) {
-        *self.active_query.borrow_mut() = None;
-    }
 
     /// Run a search query and rebuild the thread tree filtered to
     /// only those threads containing at least one match.

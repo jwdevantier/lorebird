@@ -135,10 +135,11 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     main_vbox.append(&status_label);
     window.set_child(Some(&main_vbox));
 
-    // ── Wire sidebar selection → profile selection ────────────
+    // ── Wire sidebar selection → profile + view/search ──────
     let state_for_sidebar = state.clone();
     let status_for_sidebar = status_label.clone();
-    let model = sidebar_model; // moved into closure
+    let search_for_sidebar = search_entry.clone();
+    let model = sidebar_model;
     sidebar_lb.connect_row_selected(move |_lb, row| {
         let Some(row) = row else { return };
         let idx = row.index() as u32;
@@ -152,29 +153,67 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         let query = item.query();
         let kind = item.row_kind();
 
+        // Filter out non-interactive rows
+        if kind == "separator" || kind == "placeholder" {
+            return;
+        }
+
+        let s = state_for_sidebar.borrow();
+
         match kind.as_str() {
             "profile-header" => {
-                let s = state_for_sidebar.borrow();
                 s.select_profile(&profile);
+                // Clear any active search
+                search_for_sidebar.set_text("");
                 status_for_sidebar.set_text(&format!(
                     "Selected profile: {} \u{2014} click Index to load",
                     profile
                 ));
             }
             "all-mail" => {
-                let s = state_for_sidebar.borrow();
                 s.select_profile(&profile);
-                s.clear_view();
-                status_for_sidebar.set_text(&format!("All mail for: {}", profile));
+
+                // Auto-index if DB not open for this maildir
+                if s.db.borrow().is_none() {
+                    match s.index_and_rebuild() {
+                        Ok(n) => status_for_sidebar.set_text(&format!(
+                            "Indexed {} messages, showing all for {}",
+                            n, profile
+                        )),
+                        Err(e) => status_for_sidebar.set_text(&format!("Error: {}", e)),
+                    }
+                } else {
+                    // DB already indexed — just show all
+                    match s.show_all() {
+                        Ok(()) => status_for_sidebar.set_text(&format!(
+                            "All mail for: {}", profile
+                        )),
+                        Err(e) => status_for_sidebar.set_text(&format!("Error: {}", e)),
+                    }
+                }
+                search_for_sidebar.set_text("");
             }
             "view" => {
-                let s = state_for_sidebar.borrow();
                 s.select_profile(&profile);
+
+                // Auto-index if needed
+                if s.db.borrow().is_none() {
+                    if let Err(e) = s.index_and_rebuild() {
+                        status_for_sidebar.set_text(&format!("Error: {}", e));
+                        return;
+                    }
+                }
+
+                // Run the view's query
                 s.select_view(query.to_string());
-                status_for_sidebar.set_text(&format!(
-                    "View \u{2018}{}\u{2019} in: {}",
-                    query, profile
-                ));
+                search_for_sidebar.set_text(&query);
+                match s.search(&query) {
+                    Ok(n) => status_for_sidebar.set_text(&format!(
+                        "View \u{2018}{}\u{2019} in: {} \u{2014} {} match(es)",
+                        item.name(), profile, n
+                    )),
+                    Err(e) => status_for_sidebar.set_text(&format!("Search error: {}", e)),
+                }
             }
             _ => {}
         }
@@ -460,6 +499,10 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
     // ── Selection ───────────────────────────────────────────
     let selection = SingleSelection::new(Some(tree_model));
     selection.set_can_unselect(true);
+    selection.set_autoselect(false);
+    // autoselect=false means clicking the expander arrow toggles
+    // expand/collapse without also selecting the row.
+    // Selection only changes on an intentional click on the row content.
 
     // ── Column view ─────────────────────────────────────────
     let column_view = ColumnView::new(Some(selection.clone()));
