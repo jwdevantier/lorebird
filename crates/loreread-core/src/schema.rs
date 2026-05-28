@@ -20,6 +20,7 @@ pub fn init_db(conn: &Connection) -> SqlResult<()> {
             message_id  TEXT PRIMARY KEY,
             refs         TEXT,   -- space-separated Message-IDs (In-Reply-To appended)
             subject     TEXT,
+            from_addr   TEXT,          -- from From: header, for display
             date        TEXT,          -- from Date: header, display only
             received_ts INTEGER,       -- from Received: header, Unix epoch
             filename    TEXT NOT NULL UNIQUE  -- path relative to maildir root (base name, no flags)

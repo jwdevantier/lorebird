@@ -13,3 +13,4 @@ glib = { version = "0.20", features = ["v2_74"] }
 gio = "0.20"
 loreread-core = { path = "../loreread-core" }
 loreread-lua = { path = "../loreread-lua" }
+rusqlite = { version = "0.39", features = ["bundled"] }

@@ -108,12 +108,12 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
 
             // ── mail_ndx (INSERT OR IGNORE — filename UNIQUE catches dupes) ──
             let ndx_changes = conn.execute(
-                "INSERT OR IGNORE INTO mail_ndx (message_id, refs, subject, date, received_ts, filename)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR IGNORE INTO mail_ndx (message_id, refs, subject, from_addr, date, received_ts, filename)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     msg_id,
                     refs,
                     msg.subject,
+                    msg.from_addr,
                     msg.date_rfc3339,
                     msg.received_ts,
                     rel_path,
