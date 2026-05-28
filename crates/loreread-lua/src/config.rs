@@ -1,0 +1,251 @@
+//! Configuration types for loreread.
+//!
+//! These types represent the data portion of a Lua config file,
+//! deserialised via `mlua::serde`.  Lua function hooks (`on_fetch`,
+//! `on_reply`, `on_send`) are stored separately in [`ProfileHooks`]
+//! and [`GlobalHooks`] since they cannot be serde-deserialised.
+//!
+//! Name/email resolution follows a cascade: per-profile values
+//! override global `user` defaults.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use serde::Deserialize;
+
+// ── Data types (serde-deserialisable) ─────────────────────────────
+
+/// Global user identity — provides default `name` and `email`
+/// for profiles that don't define their own.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserInfo {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+/// A saved view — a named query string shown in the sidebar.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewConfig {
+    pub label: String,
+    pub query: String,
+}
+
+/// Per-profile data (deserialisable from Lua, **excludes** hooks).
+///
+/// The `on_fetch` function is extracted separately as an
+/// [`mlua::Function`] and stored in [`ProfileHooks`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProfileData {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    pub maildir: String,
+    #[serde(default)]
+    pub views: Vec<ViewConfig>,
+}
+
+/// Top-level config data (deserialisable from Lua, **excludes** hooks).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub user: Option<UserInfo>,
+    pub profiles: HashMap<String, ProfileData>,
+}
+
+// ── Hook types (Lua function handles) ──────────────────────────────
+
+/// Per-profile hook handles (not serde-deserialisable).
+pub struct ProfileHooks {
+    /// Called when the user triggers a mail fetch for this profile.
+    /// Should return a truthy value on success.
+    pub on_fetch: Option<mlua::Function>,
+}
+
+/// Global hook handles (not serde-deserialisable).
+pub struct GlobalHooks {
+    /// Optional reply hook — receives a pre-filled mail table and
+    /// can modify it before the compose window opens.
+    pub on_reply: Option<mlua::Function>,
+    /// Required send hook — delivers the composed mail file.
+    pub on_send: Option<mlua::Function>,
+}
+
+// ── Fully resolved profile ─────────────────────────────────────────
+
+/// A profile with inherited defaults filled in.
+///
+/// Created by calling [`ProfileData::resolve`] with the global
+/// `UserInfo` cascade.
+#[derive(Debug, Clone)]
+pub struct ResolvedProfile {
+    pub label: String,
+    pub name: String,
+    pub email: String,
+    pub maildir: PathBuf,
+    pub views: Vec<ViewConfig>,
+}
+
+impl ProfileData {
+    /// Resolve name and email, falling back to global defaults.
+    ///
+    /// If neither the profile nor the global config provides a value,
+    /// sensible defaults are used ("Anonymous" / "unknown@localhost").
+    pub fn resolve(&self, label: &str, global: Option<&UserInfo>) -> ResolvedProfile {
+        ResolvedProfile {
+            label: label.to_string(),
+            name: self
+                .name
+                .as_deref()
+                .or(global.and_then(|u| u.name.as_deref()))
+                .unwrap_or("Anonymous")
+                .to_string(),
+            email: self
+                .email
+                .as_deref()
+                .or(global.and_then(|u| u.email.as_deref()))
+                .unwrap_or("unknown@localhost")
+                .to_string(),
+            maildir: PathBuf::from(&self.maildir),
+            views: self.views.clone(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// Resolve all profiles, filling in name/email from global defaults.
+    pub fn resolve_all(&self) -> HashMap<String, ResolvedProfile> {
+        let global = self.user.as_ref();
+        self.profiles
+            .iter()
+            .map(|(label, data)| (label.clone(), data.resolve(label, global)))
+            .collect()
+    }
+}
+
+// ── Loaded config (data + hooks together) ───────────────────────────
+
+/// The result of loading a Lua config file: data + extracted hooks.
+pub struct LoadedConfig {
+    /// Deserialisable config data.
+    pub config: AppConfig,
+    /// Per-profile hook handles (keyed by profile label).
+    pub profile_hooks: HashMap<String, ProfileHooks>,
+    /// Global hook handles.
+    pub global_hooks: GlobalHooks,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_global() -> UserInfo {
+        UserInfo {
+            name: Some("Global User".to_string()),
+            email: Some("global@example.com".to_string()),
+        }
+    }
+
+    #[test]
+    fn resolve_profile_with_local_overrides() {
+        let data = ProfileData {
+            name: Some("Local User".to_string()),
+            email: Some("local@example.com".to_string()),
+            maildir: "/tmp/mail".to_string(),
+            views: vec![ViewConfig {
+                label: "patches".to_string(),
+                query: "subject:[PATCH]".to_string(),
+            }],
+        };
+        let resolved = data.resolve("test", Some(&make_global()));
+        assert_eq!(resolved.name, "Local User");
+        assert_eq!(resolved.email, "local@example.com");
+        assert_eq!(resolved.label, "test");
+        assert_eq!(resolved.maildir, PathBuf::from("/tmp/mail"));
+        assert_eq!(resolved.views.len(), 1);
+    }
+
+    #[test]
+    fn resolve_profile_falls_back_to_global() {
+        let data = ProfileData {
+            name: None,
+            email: None,
+            maildir: "/tmp/mail".to_string(),
+            views: vec![],
+        };
+        let resolved = data.resolve("test", Some(&make_global()));
+        assert_eq!(resolved.name, "Global User");
+        assert_eq!(resolved.email, "global@example.com");
+    }
+
+    #[test]
+    fn resolve_profile_with_no_global() {
+        let data = ProfileData {
+            name: None,
+            email: None,
+            maildir: "/tmp/mail".to_string(),
+            views: vec![],
+        };
+        let resolved = data.resolve("test", None);
+        assert_eq!(resolved.name, "Anonymous");
+        assert_eq!(resolved.email, "unknown@localhost");
+    }
+
+    #[test]
+    fn resolve_profile_partial_override() {
+        // Profile sets name but not email → inherits email from global
+        let data = ProfileData {
+            name: Some("Local Name".to_string()),
+            email: None,
+            maildir: "/tmp/mail".to_string(),
+            views: vec![],
+        };
+        let resolved = data.resolve("test", Some(&make_global()));
+        assert_eq!(resolved.name, "Local Name");
+        assert_eq!(resolved.email, "global@example.com");
+    }
+
+    #[test]
+    fn resolve_all_profiles() {
+        let config = AppConfig {
+            user: Some(UserInfo {
+                name: Some("Default".to_string()),
+                email: Some("default@example.com".to_string()),
+            }),
+            profiles: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "work".to_string(),
+                    ProfileData {
+                        name: Some("Work User".to_string()),
+                        email: Some("work@example.com".to_string()),
+                        maildir: "/tmp/work".to_string(),
+                        views: vec![],
+                    },
+                );
+                m.insert(
+                    "personal".to_string(),
+                    ProfileData {
+                        name: None,
+                        email: None,
+                        maildir: "/tmp/personal".to_string(),
+                        views: vec![ViewConfig {
+                            label: "inbox".to_string(),
+                            query: "date:1w..".to_string(),
+                        }],
+                    },
+                );
+                m
+            },
+        };
+
+        let resolved = config.resolve_all();
+        assert_eq!(resolved["work"].name, "Work User");
+        assert_eq!(resolved["work"].email, "work@example.com");
+        assert_eq!(resolved["personal"].name, "Default");
+        assert_eq!(resolved["personal"].email, "default@example.com");
+        assert_eq!(resolved["personal"].views.len(), 1);
+    }
+}
