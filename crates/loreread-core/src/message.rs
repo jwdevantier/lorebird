@@ -16,6 +16,7 @@ pub struct MailMessage {
     pub from_addr: Option<String>,
     pub date_rfc3339: Option<String>,
     pub date_ts: i64,
+    pub received_ts: i64,
     pub body_text: Option<String>,
 }
 
@@ -66,6 +67,12 @@ impl MailMessage {
         let date_rfc3339 = msg.date().map(|d| d.to_rfc3339());
         let date_ts = msg.date().map(|d| d.to_timestamp() as i64).unwrap_or(0);
 
+        let received_ts = msg
+            .received()
+            .and_then(|r| r.date)
+            .map(|d| d.to_timestamp() as i64)
+            .unwrap_or(0);
+
         let body_text = msg.body_text(0).map(|s| s.to_string());
 
         Some(Self {
@@ -75,6 +82,7 @@ impl MailMessage {
             from_addr,
             date_rfc3339,
             date_ts,
+            received_ts,
             body_text,
         })
     }
@@ -108,6 +116,10 @@ impl thread::Message for MailMessage {
 
     fn subject(&self) -> Option<&str> {
         self.subject.as_deref()
+    }
+
+    fn received_ts(&self) -> i64 {
+        self.received_ts
     }
 }
 

@@ -21,6 +21,10 @@ struct Args {
     /// Maximum depth to display (default: 10)
     #[arg(short, long, default_value = "10")]
     depth: usize,
+
+    /// Show per-thread message counts
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 /// Recursively collect all regular files under `dir`, skipping dotfiles.
@@ -88,12 +92,29 @@ fn main() {
     // Run threading
     let threads = thread::thread_messages(messages);
 
-    eprintln!("{} top-level thread(s)", threads.len());
+    let total_in_tree = count_messages(&threads);
+    eprintln!("{} top-level thread(s), {} messages total in tree", threads.len(), total_in_tree);
 
     for (i, t) in threads.iter().enumerate() {
-        println!("\n─── Thread {} ───", i + 1);
+        let msg_count = count_one(t);
+        if args.verbose {
+            eprintln!("Thread {}: {} message(s)", i + 1, msg_count);
+        }
+        println!("\n─── Thread {} ({} msg) ───", i + 1, msg_count);
         print_thread(t, 0, args.depth);
     }
+}
+
+fn count_messages(threads: &[Thread<MailMessage>]) -> usize {
+    threads.iter().map(count_one).sum()
+}
+
+fn count_one<T: loreread_core::thread::Message>(t: &Thread<T>) -> usize {
+    let mut n = if t.message.is_some() { 1 } else { 0 };
+    for child in &t.children {
+        n += count_one(child);
+    }
+    n
 }
 
 fn print_thread(node: &Thread<MailMessage>, indent: usize, max_depth: usize) {

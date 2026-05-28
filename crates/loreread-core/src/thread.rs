@@ -30,6 +30,11 @@ pub trait Message {
     /// links exist: messages sharing the same "bare" subject (after
     /// stripping "Re:", "Fwd:", etc.) are grouped together.
     fn subject(&self) -> Option<&str>;
+
+    /// Unix timestamp from the `Received:` header, for post-threading
+    /// sibling sort order (oldest first).  Messages without a
+    /// `Received:` header should return 0.
+    fn received_ts(&self) -> i64;
 }
 
 #[derive(Debug)]
@@ -231,6 +236,19 @@ fn merge_threads<T: Message>(winner: Thread<T>, loser: Thread<T>) -> Thread<T> {
     }
 }
 
+/// Recursively sort siblings within every thread subtree by
+/// `received_ts` (oldest first).  Ghost nodes (no message) sort last.
+pub fn sort_threads_by_date<T: Message>(threads: &mut [Thread<T>]) {
+    for thread in threads.iter_mut() {
+        sort_threads_by_date(&mut thread.children);
+    }
+    threads.sort_by(|a, b| {
+        let a_ts = a.message.as_ref().map(|m| m.received_ts()).unwrap_or(i64::MAX);
+        let b_ts = b.message.as_ref().map(|m| m.received_ts()).unwrap_or(i64::MAX);
+        a_ts.cmp(&b_ts)
+    });
+}
+
 /// Run the JWZ threading algorithm on an unordered collection of messages.
 ///
 /// Returns the root nodes of the thread tree — messages that have no
@@ -329,7 +347,12 @@ pub fn thread_messages<T: Message>(messages: impl IntoIterator<Item = T>) -> Vec
     drop(cs);
 
     // Step 5 - Group root set by subject
-    group_by_subject(threads)
+    let mut threads = group_by_subject(threads);
+
+    // Step 6 - Sort siblings by received date (oldest first) at every level
+    sort_threads_by_date(&mut threads);
+
+    threads
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -338,12 +361,13 @@ pub fn thread_messages<T: Message>(messages: impl IntoIterator<Item = T>) -> Vec
 mod tests {
     use super::*;
 
-    /// Simple test message for unit tests.
+/// Simple test message for unit tests.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestMessage {
         id: String,
         refs: Vec<String>,
         subject: String,
+        received_ts: i64,
     }
 
     impl Message for TestMessage {
@@ -357,6 +381,10 @@ mod tests {
 
         fn subject(&self) -> Option<&str> {
             Some(&self.subject)
+        }
+
+        fn received_ts(&self) -> i64 {
+            self.received_ts
         }
     }
 
@@ -464,6 +492,7 @@ mod tests {
             id: "a".into(),
             refs: vec![],
             subject: "Hello".into(),
+            received_ts: 0,
         }];
         let threads = thread_messages(messages);
         let ids = collect_ids(&threads);
@@ -479,16 +508,19 @@ mod tests {
                 id: "a".into(),
                 refs: vec![],
                 subject: "Hello".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "b".into(),
                 refs: vec!["a".into()],
                 subject: "Re: Hello".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "c".into(),
                 refs: vec!["a".into(), "b".into()],
                 subject: "Re: Hello".into(),
+            received_ts: 0,
             },
         ];
 
@@ -508,16 +540,19 @@ mod tests {
                 id: "c".into(),
                 refs: vec!["a".into(), "b".into()],
                 subject: "Re: Topic".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "a".into(),
                 refs: vec![],
                 subject: "Topic".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "b".into(),
                 refs: vec![],
                 subject: "Re: Topic".into(),
+            received_ts: 0,
             },
         ];
 
@@ -538,6 +573,7 @@ mod tests {
             id: "b".into(),
             refs: vec!["a".into()],
             subject: "Re: Hello".into(),
+            received_ts: 0,
         }];
 
         let threads = thread_messages(messages);
@@ -554,6 +590,7 @@ mod tests {
             id: "c".into(),
             refs: vec!["a".into(), "b".into()],
             subject: "Re: Hello".into(),
+            received_ts: 0,
         }];
 
         let threads = thread_messages(messages);
@@ -571,11 +608,13 @@ mod tests {
                 id: "x".into(),
                 refs: vec!["a".into()],
                 subject: "Re: Topic".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "y".into(),
                 refs: vec!["a".into()],
                 subject: "Re: Topic".into(),
+            received_ts: 0,
             },
         ];
 
@@ -600,16 +639,19 @@ mod tests {
                 id: "1".into(),
                 refs: vec![],
                 subject: "Meeting notes".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "2".into(),
                 refs: vec![],
                 subject: "Re: Meeting notes".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "3".into(),
                 refs: vec![],
                 subject: "Re: Re: Meeting notes".into(),
+            received_ts: 0,
             },
         ];
 
@@ -630,16 +672,19 @@ mod tests {
                 id: "x".into(),
                 refs: vec!["ghost".into()],
                 subject: "Re: Topic".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "y".into(),
                 refs: vec!["ghost".into()],
                 subject: "Re: Re: Topic".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "z".into(),
                 refs: vec![],
                 subject: "Topic".into(),
+            received_ts: 0,
             },
         ];
 
@@ -657,11 +702,13 @@ mod tests {
                 id: "a".into(),
                 refs: vec![],
                 subject: "Hello".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "b".into(),
                 refs: vec![],
                 subject: "World".into(),
+            received_ts: 0,
             },
         ];
 
@@ -679,21 +726,25 @@ mod tests {
                 id: "x".into(),
                 refs: vec![],
                 subject: "Alpha".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "y".into(),
                 refs: vec!["x".into()],
                 subject: "Re: Alpha".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "p".into(),
                 refs: vec![],
                 subject: "Beta".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "q".into(),
                 refs: vec![],
                 subject: "Gamma".into(),
+            received_ts: 0,
             },
         ];
 
@@ -727,11 +778,13 @@ mod tests {
                 id: "a".into(),
                 refs: vec!["b".into()],
                 subject: "Re: Hello".into(),
+            received_ts: 0,
             },
             TestMessage {
                 id: "b".into(),
                 refs: vec![],
                 subject: "Hello".into(),
+            received_ts: 0,
             },
         ];
 
@@ -753,6 +806,7 @@ mod tests {
             id: "has_id".into(),
             refs: vec![],
             subject: "Topic".into(),
+            received_ts: 0,
         }];
         let threads = thread_messages(messages);
         assert_eq!(threads.len(), 1);
