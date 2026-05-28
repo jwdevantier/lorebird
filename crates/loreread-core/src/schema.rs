@@ -22,7 +22,7 @@ pub fn init_db(conn: &Connection) -> SqlResult<()> {
             subject     TEXT,
             date        TEXT,          -- from Date: header, display only
             received_ts INTEGER,       -- from Received: header, Unix epoch
-            filename    TEXT NOT NULL  -- path relative to maildir root (base name, no flags)
+            filename    TEXT NOT NULL UNIQUE  -- path relative to maildir root (base name, no flags)
         );
 
         CREATE INDEX IF NOT EXISTS idx_mail_ndx_received_ts

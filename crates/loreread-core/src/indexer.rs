@@ -3,6 +3,11 @@
 //!
 //! Uses `mail_parser` (Stalwart Labs) for parsing and walks the filesystem
 //! directly — no `maildir` crate needed.
+//!
+//! The entire indexing operation runs inside a single SQLite transaction
+//! for performance.  New-mail detection uses the `filename` UNIQUE
+//! constraint on `mail_ndx` via `INSERT OR IGNORE`, avoiding a separate
+//! SELECT per message.
 
 use rusqlite::{params, Connection, Result as SqlResult};
 use std::path::Path;
@@ -44,14 +49,26 @@ fn collect_mail_files(dir: &Path) -> Vec<std::path::PathBuf> {
 
 /// Index every message in `maildir_path`, inserting rows into `conn`.
 ///
-/// Identifies new messages by comparing the stable base filename (flags
-/// stripped) against the `filename` column in `mail_ndx`.  The mail fetcher
-/// is expected to guarantee stable base filenames and to only write new
-/// mail to disk, so a missing base name means unindexed mail.
+/// New mail is detected via a `UNIQUE` constraint on `mail_ndx.filename`:
+/// `INSERT OR IGNORE` silently skips already-indexed files.  The mail
+/// fetcher must guarantee stable base filenames and only write new mail
+/// to disk.
 ///
 /// Returns the number of newly inserted messages.
 pub fn index_maildir(conn: &Connection, maildir_path: &Path) -> SqlResult<usize> {
     schema::init_db(conn)?;
+
+    // Wrap all inserts in a single transaction — avoids per-row fsync.
+    conn.execute_batch("BEGIN")?;
+    let result = index_maildir_inner(conn, maildir_path);
+    match &result {
+        Ok(_) => conn.execute_batch("COMMIT")?,
+        Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+    }
+    result
+}
+
+fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usize> {
 
     let mut inserted = 0usize;
 
@@ -66,28 +83,13 @@ pub fn index_maildir(conn: &Connection, maildir_path: &Path) -> SqlResult<usize>
             };
             let base = stable_basename(file_name);
 
-            // Build relative path using the stable base name (no flags).
-            // The fetcher may later update flags, but the base name stays
-            // the same — we won't re-index.
+            // Build relative path using the stable base name (no flags)
             let rel_path = file_path
                 .with_file_name(base)
                 .strip_prefix(maildir_path)
                 .unwrap_or(&file_path)
                 .to_string_lossy()
                 .to_string();
-
-            // Skip if already indexed
-            let exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM mail_ndx WHERE filename = ?1",
-                    params![rel_path],
-                    |r| r.get(0),
-                )
-                .unwrap_or(false);
-
-            if exists {
-                continue;
-            }
 
             let raw = match std::fs::read(&file_path) {
                 Ok(b) => b,
@@ -104,9 +106,9 @@ pub fn index_maildir(conn: &Connection, maildir_path: &Path) -> SqlResult<usize>
 
             let refs = msg.references.join(" ");
 
-            // ── mail_ndx: metadata for threading & file location ──
-            conn.execute(
-                "INSERT INTO mail_ndx (message_id, refs, subject, date, received_ts, filename)
+            // ── mail_ndx (INSERT OR IGNORE — filename UNIQUE catches dupes) ──
+            let ndx_changes = conn.execute(
+                "INSERT OR IGNORE INTO mail_ndx (message_id, refs, subject, date, received_ts, filename)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     msg_id,
@@ -118,7 +120,11 @@ pub fn index_maildir(conn: &Connection, maildir_path: &Path) -> SqlResult<usize>
                 ],
             )?;
 
-            // ── mail_fts: full-text search ──
+            if ndx_changes == 0 {
+                continue; // already indexed (duplicate filename)
+            }
+
+            // ── mail_fts ──
             conn.execute(
                 "INSERT INTO mail_fts (message_id, date, \"from\", subject, \"to\", cc, body)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
