@@ -165,6 +165,35 @@ impl AppState {
         *self.active_query.borrow_mut() = None;
     }
 
+    /// Run a search query and rebuild the thread tree filtered to
+    /// only those threads containing at least one match.
+    pub fn search(&self, query: &str) -> Result<usize, String> {
+        let maildir = self.active_maildir.borrow().clone();
+        if maildir.as_os_str().is_empty() {
+            return Err("no profile selected".to_string());
+        }
+        if self.db.borrow().is_none() {
+            return Err("no database open — click Index first".to_string());
+        }
+
+        self.rebuild_thread_tree_searched(&maildir, query)
+    }
+
+    /// Clear search results and show all messages again.
+    pub fn show_all(&self) -> Result<(), String> {
+        let maildir = self.active_maildir.borrow().clone();
+        if maildir.as_os_str().is_empty() {
+            return Err("no profile selected".to_string());
+        }
+        if self.db.borrow().is_none() {
+            return Err("no database open — click Index first".to_string());
+        }
+
+        let db = self.db.borrow();
+        let conn = db.as_ref().ok_or("database not open")?;
+        self.rebuild_thread_tree(conn, &maildir)
+    }
+
     /// Open (or create) the index database for `maildir`.
     ///
     /// The database is stored at `{maildir}/.loreread.db`.
@@ -209,10 +238,10 @@ impl AppState {
             let db = self.db.borrow();
             let conn = db.as_ref().ok_or("database not open")?;
 
-            // If a view query is active, filter messages
+            // If a view query is active, filter to matching threads
             let query_str = self.active_query.borrow();
             if let Some(ref q) = *query_str {
-                self.rebuild_thread_tree_filtered(conn, &maildir, q)?;
+                self.rebuild_thread_tree_searched(&maildir, q)?;
             } else {
                 self.rebuild_thread_tree(conn, &maildir)?;
             }
@@ -241,36 +270,6 @@ impl AppState {
         Ok(())
     }
 
-    /// Rebuild the thread tree, filtering to only those threads that
-    /// contain at least one message matching the query.
-    pub fn rebuild_thread_tree_filtered(
-        &self,
-        conn: &Connection,
-        maildir: &std::path::Path,
-        query: &str,
-    ) -> Result<(), String> {
-        let parsed = loreread_core::query::parse_query(query)
-            .map_err(|e| format!("bad query '{}': {:?}", query, e))?;
-        let pq = loreread_core::query::ParsedQuery::from_ast(&parsed, 500);
-
-        let matching_ids = loreread_core::query::search(conn, &pq)
-            .map_err(|e| format!("search failed: {}", e))?;
-
-        // Load matching messages and thread them
-        let messages = loreread_core::store::load_messages_by_ids(conn, &matching_ids)
-            .map_err(|e| format!("query failed: {}", e))?;
-
-        let threads = thread::thread_messages(messages);
-
-        self.root_model.remove_all();
-        let node_tree = ThreadNodeTree::from_threads(&threads, maildir);
-        for root_node in &node_tree.roots {
-            self.root_model.append(root_node);
-        }
-
-        Ok(())
-    }
-
     /// Call the on_fetch Lua hook for the active profile.
     /// Returns `Ok(true)` if the hook succeeded and wants re-indexing,
     /// `Ok(false)` if it returned falsy, `Err` on failure.
@@ -283,6 +282,52 @@ impl AppState {
             .ok_or_else(|| format!("no hooks for profile '{}'", label))?;
         self.vm.call_on_fetch(&label, hooks)
             .map_err(|e| format!("on_fetch hook failed: {}", e))
+    }
+
+    /// Rebuild the thread tree filtered by a search query.
+    /// Uses the approach from tools/mail-query: thread ALL messages,
+    /// then show only the root threads containing matches.
+    fn rebuild_thread_tree_searched(
+        &self,
+        maildir: &std::path::Path,
+        query: &str,
+    ) -> Result<usize, String> {
+        let parsed = loreread_core::query::parse_query(query)
+            .map_err(|e| format!("bad query '{}': {:?}", query, e))?;
+        let pq = loreread_core::query::ParsedQuery::from_ast(&parsed, 5000);
+
+        let db = self.db.borrow();
+        let conn = db.as_ref().ok_or("database not open")?;
+
+        // 1. Get matching message IDs from FTS5
+        let matched_ids: Vec<String> = loreread_core::query::search(conn, &pq)
+            .map_err(|e| format!("search failed: {}", e))?;
+        let match_count = matched_ids.len();
+
+        // 2. Thread ALL messages
+        let all_messages = loreread_core::store::load_all_messages(conn)
+            .map_err(|e| format!("query failed: {}", e))?;
+        let threads = thread::thread_messages(all_messages);
+
+        // 3. Map matching IDs &rarr; root-thread indices
+        let thread_index = thread::build_thread_index(&threads);
+        let mut seen_threads: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for id in &matched_ids {
+            if let Some(&ndx) = thread_index.get(id) {
+                seen_threads.insert(ndx);
+            }
+        }
+
+        // 4. Display only threads that contain matches
+        self.root_model.remove_all();
+        let node_tree = ThreadNodeTree::from_threads_filtered(
+            &threads, maildir, &seen_threads,
+        );
+        for root_node in &node_tree.roots {
+            self.root_model.append(root_node);
+        }
+
+        Ok(match_count)
     }
 }
 
@@ -331,6 +376,23 @@ impl ThreadNodeTree {
         let roots: Vec<ThreadNode> = threads
             .iter()
             .map(|t| Self::build_node(t, maildir))
+            .collect();
+        Self { roots }
+    }
+
+    /// Like `from_threads`, but only include root threads whose index
+    /// appears in `seen_threads`.  Used for search filtering: display
+    /// only threads that contain at least one matching message.
+    fn from_threads_filtered(
+        threads: &[Thread<DbMessage>],
+        maildir: &std::path::Path,
+        seen_threads: &std::collections::HashSet<usize>,
+    ) -> Self {
+        let roots: Vec<ThreadNode> = threads
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| seen_threads.contains(i))
+            .map(|(_, t)| Self::build_node(t, maildir))
             .collect();
         Self { roots }
     }

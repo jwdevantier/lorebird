@@ -116,7 +116,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     outer_paned.set_shrink_start_child(false);
 
     // Center + preview
-    let (center, selection, preview_labels) =
+    let (center, selection, preview_labels, search_entry) =
         build_center_pane(&state_ref.root_model);
     inner_paned.set_start_child(Some(&center));
     inner_paned.set_shrink_start_child(false);
@@ -137,7 +137,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     // ── Wire sidebar selection → profile selection ────────────
     let state_for_sidebar = state.clone();
-    let status_for_sidebar = status_label;
+    let status_for_sidebar = status_label.clone();
     let model = sidebar_model; // moved into closure
     sidebar_lb.connect_row_selected(move |_lb, row| {
         let Some(row) = row else { return };
@@ -203,6 +203,55 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         pl.subject_label.set_text("");
         pl.date_label.set_text("");
         pl.body_buffer.set_text("");
+    });
+
+    // ── Wire search bar ──────────────────────────────────────────
+    // Enter / activate → run search query
+    let state_for_search = state.clone();
+    let status_for_search = status_label.clone();
+    search_entry.connect_activate(move |entry| {
+        let query = entry.text().to_string();
+        if query.is_empty() {
+            // Empty query → show all
+            let s = state_for_search.borrow();
+            match s.show_all() {
+                Ok(()) => {
+                    status_for_search.set_text("Showing all threads");
+                }
+                Err(e) => {
+                    status_for_search.set_text(&format!("Error: {}", e));
+                }
+            }
+        } else {
+            let s = state_for_search.borrow();
+            match s.search(&query) {
+                Ok(n) => {
+                    status_for_search.set_text(&format!(
+                        "Found {} matching message(s) in thread(s)",
+                        n
+                    ));
+                }
+                Err(e) => {
+                    status_for_search.set_text(&format!("Search error: {}", e));
+                }
+            }
+        }
+    });
+
+    // Escape / stop-search → clear search, show all
+    let state_for_clear = state.clone();
+    let status_for_clear = status_label;
+    search_entry.connect_stop_search(move |entry| {
+        entry.set_text("");
+        let s = state_for_clear.borrow();
+        match s.show_all() {
+            Ok(()) => {
+                status_for_clear.set_text("Showing all threads");
+            }
+            Err(e) => {
+                status_for_clear.set_text(&format!("Error: {}", e));
+            }
+        }
     });
 
     window.present();
@@ -347,7 +396,7 @@ pub(crate) struct PreviewLabels {
 
 /// Build the centre pane, returning the root widget, the selection model
 /// (for wiring to the preview), and the preview labels.
-fn build_center_pane(root_model: &ListStore) -> (Box, SingleSelection, PreviewLabels) {
+fn build_center_pane(root_model: &ListStore) -> (Box, SingleSelection, PreviewLabels, SearchEntry) {
     let vbox = Box::new(Orientation::Vertical, 0);
 
     // ── Search bar ────────────────────────────────────────────
@@ -386,7 +435,7 @@ fn build_center_pane(root_model: &ListStore) -> (Box, SingleSelection, PreviewLa
         body_buffer,
     };
 
-    (vbox, selection, preview_labels)
+    (vbox, selection, preview_labels, search)
 }
 
 // ── Thread list (ColumnView + TreeListModel) ──────────────────────
