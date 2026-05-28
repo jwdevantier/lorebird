@@ -14,6 +14,8 @@ pub struct MailMessage {
     pub references: Vec<String>,
     pub subject: Option<String>,
     pub from_addr: Option<String>,
+    pub to_addr: Option<String>,
+    pub cc_addr: Option<String>,
     pub date_rfc3339: Option<String>,
     pub date_ts: i64,
     pub received_ts: i64,
@@ -47,22 +49,9 @@ impl MailMessage {
 
         let subject = msg.subject().map(|s| s.to_string());
 
-        let from_addr = msg.from().and_then(|a| match a {
-            mail_parser::Address::List(addrs) => addrs.first().map(|a| {
-                a.address
-                    .as_ref()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default()
-            }),
-            mail_parser::Address::Group(groups) => groups.first().and_then(|g| {
-                g.addresses.first().map(|a| {
-                    a.address
-                        .as_ref()
-                        .map(|s| s.to_string())
-                        .unwrap_or_default()
-                })
-            }),
-        });
+        let from_addr = first_addr(msg.from());
+        let to_addr = all_addrs(msg.to());
+        let cc_addr = all_addrs(msg.cc());
 
         let date_rfc3339 = msg.date().map(|d| d.to_rfc3339());
         let date_ts = msg.date().map(|d| d.to_timestamp() as i64).unwrap_or(0);
@@ -80,12 +69,36 @@ impl MailMessage {
             references,
             subject,
             from_addr,
+            to_addr,
+            cc_addr,
             date_rfc3339,
             date_ts,
             received_ts,
             body_text,
         })
     }
+}
+
+/// Extract the first email address from a mail_parser `Address` enum.
+fn first_addr(addr: Option<&mail_parser::Address>) -> Option<String> {
+    use mail_parser::Address;
+    addr.and_then(|a| match a {
+        Address::List(addrs) => addrs.first().and_then(|a| a.address.clone().map(|s| s.to_string())),
+        Address::Group(groups) => groups.first().and_then(|g| g.addresses.first().and_then(|a| a.address.clone().map(|s| s.to_string()))),
+    })
+}
+
+/// Collect all email addresses from a mail_parser `Address` enum into a
+/// single space-separated string (for FTS5 tokenization).
+fn all_addrs(addr: Option<&mail_parser::Address>) -> Option<String> {
+    use mail_parser::Address;
+    let addrs: Vec<String> = addr
+        .map(|a| match a {
+            Address::List(list) => list.iter().filter_map(|a| a.address.clone()).map(|s| s.to_string()).collect(),
+            Address::Group(groups) => groups.iter().flat_map(|g| g.addresses.iter().filter_map(|a| a.address.clone().map(|s| s.to_string()))).collect(),
+        })
+        .unwrap_or_default();
+    if addrs.is_empty() { None } else { Some(addrs.join(" ")) }
 }
 
 /// Extension trait to extract message IDs from a `HeaderValue`.
