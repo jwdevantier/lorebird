@@ -1,10 +1,9 @@
 # loreread
 
-**Index and browse a maildir with GTK, Guile, and SQLite.**
+**Index and browse a maildir with GTK, Lua, and SQLite.**
 
-A desktop application built with Rust and GTK4, embedding a Guile Scheme runtime
-for extensibility, backed by SQLite with full-text search (FTS5), and capable of
-parsing maildir archives.
+A desktop application built with Rust and GTK4, embedding a Lua runtime
+for extensibility, backed by SQLite with full-text search (FTS5).
 
 ## Quick start
 
@@ -17,7 +16,29 @@ nix build
 
 # Or enter the dev shell and cargo-run
 nix develop
-cargo run
+cargo run -p loreread
+```
+
+## Workspace structure
+
+```
+loreread/
+├── Cargo.toml                 # workspace manifest
+├── Cargo.lock
+├── flake.nix
+├── crates/
+│   ├── loreread-core/         # email logic: threading, schema, indexing, query
+│   │   └── src/
+│   │       ├── thread.rs      # JWZ threading algorithm
+│   │       ├── message.rs     # mail_parser → domain types bridge
+│   │       ├── schema.rs      # SQLite FTS5 tables & migrations
+│   │       ├── indexer.rs     # maildir → SQLite indexer
+│   │       └── query.rs       # FTS5 query parser & search
+│   ├── loreread-lua/          # Lua VM integration (mlua)
+│   └── loreread-gtk/          # GTK4 UI (binary: loreread)
+└── tools/
+    ├── maildir-index/         # CLI: index a maildir into SQLite
+    └── thread-test/           # CLI: run JWZ threading on a maildir
 ```
 
 ## Development
@@ -36,26 +57,63 @@ This drops you into a shell with:
 | `rust-analyzer` | LSP server (IDE integration) |
 | `clippy` | Rust linter |
 | `rustfmt` | Rust formatter |
-| `pkg-config` | Locate system libraries (GTK, Guile) |
+| `pkg-config` | Locate system libraries |
 | `gtk4` (dev) | GTK4 headers & libraries for gtk-rs |
-| `guile` (dev) | GNU Guile runtime & C headers for FFI |
 | `sqlite3` | SQLite CLI (`sqlite-interactive`) |
 
-All library search paths are set up automatically — `cargo build`, `cargo run`,
-and `cargo test` work out of the box.
+### Fast iteration (no GTK)
+
+Most logic lives in `loreread-core` which has **zero GUI dependencies** —
+builds in ~0.2s instead of ~45s.
+
+```bash
+# Check core for errors (fast)
+cargo check -p loreread-core
+
+# Run all core tests (36 tests, <0.1s)
+cargo test -p loreread-core
+
+# Run only thread tests (26 tests)
+cargo test -p loreread-core thread::
+
+# Run a single test
+cargo test -p loreread-core thread::tests::linear_thread_by_references
+```
 
 ### Edit-Compile-Run loop
 
 ```bash
-nix develop          # enter shell once
+nix develop               # enter shell once
 
-cargo check          # fast compile check, no binary
-cargo build          # debug build
-cargo run            # build + run in one step
-cargo test           # run unit tests
+cargo check --workspace   # check everything (fast)
+cargo build --workspace   # debug build all
+cargo run -p loreread     # build + run the GTK app
+cargo test --workspace    # run all tests
 
-# Release build (same as `nix build`)
+# Release build
 cargo build --release
+```
+
+### CLI tools
+
+Two standalone CLI binaries for testing functionality without the GUI:
+
+```bash
+# Build a tool
+cargo build -p thread-test
+cargo build -p maildir-index
+
+# Run (pass args after --)
+cargo run -p thread-test -- --maildir /path/to/maildir
+cargo run -p maildir-index -- --maildir /path/to/maildir --db /tmp/index.db
+
+# Or run the built binary directly
+./target/debug/thread-test --maildir ~/Mail/lkml --depth 5
+./target/debug/maildir-index --maildir ~/Mail/lkml --db ~/Mail/index.db
+
+# Release builds
+cargo build --release -p thread-test
+./target/release/thread-test --maildir ~/Mail/lkml
 ```
 
 ### IDE setup
@@ -73,73 +131,57 @@ direnv allow
 ### Linting & formatting
 
 ```bash
-cargo clippy         # lint with helpful suggestions
-cargo fmt            # format all Rust sources
-cargo fmt -- --check # check formatting only (CI)
+cargo clippy --workspace
+cargo fmt
+cargo fmt -- --check    # check formatting only (CI)
 ```
 
 ### Update dependencies
 
 ```bash
 nix develop
-cargo update         # bump Cargo.lock to latest semver-compatible
-nix flake update     # bump nixpkgs revision
+cargo update            # bump Cargo.lock to latest semver-compatible
+nix flake update        # bump nixpkgs revision
 ```
 
 After `cargo update` you must rebuild with `nix build` to refresh the Nix
 vendor hash. The `cargoLock.lockFile` approach used here means no manual hash
 management — Nix reads `Cargo.lock` directly.
 
-## Project structure
-
-```
-loreread/
-├── flake.nix          # Nix dev shell + package definition
-├── Cargo.toml         # Rust crate manifest
-├── Cargo.lock         # Pinned dependency versions
-└── src/
-    └── main.rs        # GTK4 UI + Guile FFI entry point
-```
-
 ## How the pieces fit together
 
 ### GTK (GUI)
 
-The `gtk4` Rust crate (v0.9, gtk-rs) provides safe Rust bindings to GTK4.
-A window is created with a vertical box containing a button and a label.
-Clicking the button triggers a Guile Scheme evaluation and displays the result.
+The `loreread-gtk` crate provides the GTK4 UI. It depends on `loreread-core`
+for all email logic and `loreread-lua` for scripting/config.
 
-### Guile (embedded Scheme)
+### Lua (configuration & hooks)
 
-Guile is linked via raw FFI (`#[link(name = "guile-3.0")]`). On startup,
-`scm_init_guile()` boots the interpreter. On button click, a Scheme expression
-is evaluated with `scm_c_eval_string()`, and the result string is extracted via
-`scm_to_locale_string()`.
-
-The `guile` module inside `src/main.rs` wraps these C calls in a safe
-`guile::eval(&str) -> Result<String, String>` function.
+`loreread-lua` wraps `mlua` (Lua 5.4, vendored). Configuration, fetch hooks,
+reply templates, and send hooks are all expressed in Lua — much like neovim's
+approach. The VM is started at app launch and exposes APIs for maildir
+operations, searching, and UI callbacks.
 
 ### SQLite + FTS5
 
-`rusqlite` (v0.39) with the `bundled` feature compiles its own copy of SQLite
-from source, enabling FTS5, JSON1, and other extensions. The crate is available
-as a dependency and ready to use — just add `use rusqlite::Connection;` and
-open a database.
+`loreread-core` uses `rusqlite` (v0.39, bundled) with FTS5 for full-text
+search. The schema module creates tables, triggers, and the FTS5 virtual table.
+The query module provides a Xapian-style query parser that compiles to FTS5
+MATCH expressions.
 
-### Maildir parsing
+### Mail parsing
 
-The `maildir` crate (v0.6) provides a pure-Rust maildir reader. Use it to
-iterate over messages in a maildir tree:
+`loreread-core` uses `mail-parser` (Stalwart Labs, v0.10) to parse raw email
+bytes. The `message.rs` module extracts the fields we care about (Message-ID,
+References, Subject, From, Date, body) and implements the `thread::Message`
+trait so parsed messages can be fed directly to the JWZ threading algorithm.
 
-```rust
-use maildir::Maildir;
+### Maildir indexing
 
-let md = Maildir::from("/path/to/maildir");
-for entry in md.list_new() {
-    let mail = entry.unwrap().parsed().unwrap();
-    println!("From: {:?}", mail.headers.get_first("From"));
-}
-```
+`loreread-core` walks the maildir filesystem directly (no `maildir` crate) —
+iterating `cur/` and `new/` subdirectories, reading each file as raw bytes,
+and passing them to `mail_parser`. The `maildir-index` CLI tool exercises this
+code path independently of the GUI.
 
 ## Building without Nix
 
@@ -147,13 +189,13 @@ If you don't use Nix, install system packages manually:
 
 ```bash
 # Ubuntu / Debian
-sudo apt install libgtk-4-dev guile-3.0-dev libsqlite3-dev pkg-config
+sudo apt install libgtk-4-dev libsqlite3-dev pkg-config
 
 # Fedora
-sudo dnf install gtk4-devel guile-devel sqlite-devel pkg-config
+sudo dnf install gtk4-devel sqlite-devel pkg-config
 
 # macOS
-brew install gtk4 guile sqlite3 pkg-config
+brew install gtk4 sqlite3 pkg-config
 ```
 
 Then use standard Cargo commands:
