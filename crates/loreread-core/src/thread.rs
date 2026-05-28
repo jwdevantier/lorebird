@@ -249,6 +249,30 @@ pub fn sort_threads_by_date<T: Message>(threads: &mut [Thread<T>]) {
     });
 }
 
+/// Build a message-ID → top-level thread index lookup.
+///
+/// After calling `thread_messages`, use this to quickly find which
+/// top-level thread a given message belongs to.  All messages in a
+/// thread (including deeply nested replies) map to the same index.
+pub fn build_thread_index<T: Message>(threads: &[Thread<T>]) -> HashMap<String, usize> {
+    let mut index = HashMap::new();
+    for (i, thread) in threads.iter().enumerate() {
+        index_thread(thread, i, &mut index);
+    }
+    index
+}
+
+fn index_thread<T: Message>(thread: &Thread<T>, ndx: usize, index: &mut HashMap<String, usize>) {
+    if let Some(ref msg) = thread.message {
+        if let Some(id) = msg.message_id() {
+            index.insert(id.to_string(), ndx);
+        }
+    }
+    for child in &thread.children {
+        index_thread(child, ndx, index);
+    }
+}
+
 /// Run the JWZ threading algorithm on an unordered collection of messages.
 ///
 /// Returns the root nodes of the thread tree — messages that have no

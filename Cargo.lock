@@ -787,6 +787,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-query"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "loreread-core",
+ "rusqlite",
+]
+
+[[package]]
 name = "maildir-index"
 version = "0.1.0"
 dependencies = [

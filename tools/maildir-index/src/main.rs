@@ -2,9 +2,13 @@
 //!
 //! Usage:
 //!   maildir-index --maildir /path/to/maildir --db /path/to/index.db
+//!   maildir-index --maildir /path/to/maildir --db /path/to/index.db --rebuild
 //!
 //! Walks the maildir, parses every message, and inserts metadata into
 //! the SQLite database (creating tables on first run).
+//!
+//! By default only new messages (by stable base filename) are indexed.
+//! Pass `--rebuild` to drop and recreate the index from scratch.
 
 use clap::Parser;
 use loreread_core::{indexer, schema};
@@ -21,6 +25,10 @@ struct Args {
     /// Path to the SQLite database file (will be created if it doesn't exist)
     #[arg(short, long)]
     db: PathBuf,
+
+    /// Drop existing tables and re-index everything from scratch
+    #[arg(long)]
+    rebuild: bool,
 }
 
 fn main() {
@@ -33,6 +41,15 @@ fn main() {
 
     // Enable WAL mode for concurrent readers + writer
     conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
+
+    if args.rebuild {
+        println!("Rebuilding index from scratch…");
+        conn.execute_batch("DROP TABLE IF EXISTS mail_ndx; DROP TABLE IF EXISTS mail_fts;")
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to drop tables: {e}");
+                std::process::exit(1);
+            });
+    }
 
     schema::init_db(&conn).unwrap_or_else(|e| {
         eprintln!("Failed to initialize schema: {e}");
