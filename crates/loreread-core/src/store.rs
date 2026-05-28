@@ -122,7 +122,10 @@ pub fn load_messages_by_ids(
 /// the full [`crate::message::MailMessage`].
 ///
 /// `filename` is the relative path stored in `mail_ndx.filename`,
-/// rooted at the maildir directory.
+/// rooted at the maildir directory.  The indexer strips maildir flags
+/// (`:2,S` etc.) to produce a stable basename, but the actual file on
+/// disk includes those flags.  This function handles that by doing
+/// prefix matching when the exact name isn't found.
 pub fn read_raw_message(
     maildir_path: &std::path::Path,
     filename: &str,
@@ -130,8 +133,8 @@ pub fn read_raw_message(
     let full_path = maildir_path.join(filename);
 
     // The filename in mail_ndx is the stable base name without flags.
-    // The actual file might be in cur/ or new/ with flags appended.
-    // Try cur/ first, then new/, then the raw path.
+    // The actual file might be in cur/ or new/ with flags appended
+    // (e.g. "0029...:2,S").  Try exact match first, then prefix search.
     let base = full_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -139,14 +142,30 @@ pub fn read_raw_message(
 
     for subdir in &["cur", "new"] {
         let candidate = maildir_path.join(subdir).join(base);
+
+        // 1. Try the exact stable name (works if no flags are present)
         if candidate.exists() {
             if let Ok(raw) = std::fs::read(&candidate) {
                 return crate::message::MailMessage::from_bytes(&raw);
             }
         }
+
+        // 2. The actual file may have ":2,FLAGS" appended.  Scan the
+        //    directory for files whose base name starts with `base`.
+        if let Ok(entries) = std::fs::read_dir(maildir_path.join(subdir)) {
+            for entry in entries.flatten() {
+                let entry_name = entry.file_name();
+                let entry_str = entry_name.to_string_lossy();
+                if entry_str.starts_with(base) {
+                    if let Ok(raw) = std::fs::read(&entry.path()) {
+                        return crate::message::MailMessage::from_bytes(&raw);
+                    }
+                }
+            }
+        }
     }
 
-    // Fallback: try the path as-is (might already include subdir)
+    // Fallback: try the path as-is (might already include subdir + flags)
     if full_path.exists() {
         if let Ok(raw) = std::fs::read(&full_path) {
             return crate::message::MailMessage::from_bytes(&raw);

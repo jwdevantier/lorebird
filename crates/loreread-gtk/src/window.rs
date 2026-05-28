@@ -396,7 +396,7 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
     let tree_model = TreeListModel::new(
         root_model.clone(),
         false, // passthrough=false → items are TreeListRow
-        true,  // autoexpand
+        false, // autoexpand — user must click to expand
         |item: &Object| -> Option<gio::ListModel> {
             let node = item.downcast_ref::<ThreadNode>()?;
             let children = node.children_store();
