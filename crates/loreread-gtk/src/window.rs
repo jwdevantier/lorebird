@@ -41,61 +41,46 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     title_label.add_css_class("title");
     header.set_title_widget(Some(&title_label));
 
-    let fetch_btn = gtk4::Button::with_label("Fetch");
-    let index_btn = gtk4::Button::with_label("Index");
+    let refresh_btn = gtk4::Button::from_icon_name("view-refresh");
+    refresh_btn.set_tooltip_text(Some("Refresh mail"));
 
     // ── Spinner (shown during async fetch) ─────────────────────
     let spinner = Spinner::new();
     spinner.set_spinning(false);
 
     // ── Status bar (created early so callbacks can clone it) ──
-    let status_label = Label::new(Some("Ready \u{2014} select a profile, then click Index"));
+    let status_label = Label::new(Some("Ready \u{2014} select a profile, then Refresh"));
     status_label.set_margin_start(8);
     status_label.set_margin_top(4);
     status_label.set_margin_bottom(4);
     status_label.add_css_class("dim-label");
     status_label.add_css_class("caption");
 
-    // ── Wire Index button ─────────────────────────────────────
-    let state_for_index = state.clone();
-    let status_for_index = status_label.clone();
-    index_btn.connect_clicked(move |_btn| {
-        let s = state_for_index.borrow();
-        match s.index_and_rebuild() {
-            Ok(n) => {
-                status_for_index.set_text(&format!(
-                    "Indexed {} new messages, rebuilt thread tree",
-                    n
-                ));
-            }
-            Err(e) => {
-                status_for_index.set_text(&format!("Error: {}", e));
-            }
-        }
-    });
-
-    // ── Wire Fetch button (async via Lua thread) ─────────────────
-    let state_for_fetch = state.clone();
-    let status_for_fetch = status_label.clone();
-    let spinner_for_fetch = spinner.clone();
-    fetch_btn.connect_clicked(move |_btn| {
-        let s = state_for_fetch.borrow();
+    // ── Wire Refresh button (async via Lua thread) ───────────────
+    let state_for_refresh = state.clone();
+    let status_for_refresh = status_label.clone();
+    let spinner_for_refresh = spinner.clone();
+    let refresh_btn_ref = refresh_btn.clone();
+    refresh_btn.connect_clicked(move |_btn| {
+        refresh_btn_ref.set_sensitive(false);
+        let s = state_for_refresh.borrow();
         match s.request_fetch() {
             Ok(()) => {
-                spinner_for_fetch.set_spinning(true);
-                status_for_fetch.set_text("Fetching\u{2026}");
-                // Poll for result in the main loop
-                let state_poll = state_for_fetch.clone();
-                let status_poll = status_for_fetch.clone();
-                let spinner_poll = spinner_for_fetch.clone();
+                spinner_for_refresh.set_spinning(true);
+                status_for_refresh.set_text("Refreshing\u{2026}");
+                let state_poll = state_for_refresh.clone();
+                let status_poll = status_for_refresh.clone();
+                let spinner_poll = spinner_for_refresh.clone();
+                let btn_poll = refresh_btn_ref.clone();
                 glib::timeout_add_local(Duration::from_millis(100), move || {
                     let s = state_poll.borrow();
                     match s.poll_fetch_result() {
                         Some(result) => {
                             spinner_poll.set_spinning(false);
+                            btn_poll.set_sensitive(true);
                             match s.handle_fetch_result(&result) {
                                 Ok(msg) => status_poll.set_text(&msg),
-                                Err(e) => status_poll.set_text(&format!("Fetch error: {}", e)),
+                                Err(e) => status_poll.set_text(&format!("Refresh error: {}", e)),
                             }
                             glib::ControlFlow::Break
                         }
@@ -104,13 +89,13 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 });
             }
             Err(e) => {
-                status_for_fetch.set_text(&format!("Fetch error: {}", e));
+                refresh_btn_ref.set_sensitive(true);
+                status_for_refresh.set_text(&format!("Refresh error: {}", e));
             }
         }
     });
 
-    header.pack_end(&index_btn);
-    header.pack_end(&fetch_btn);
+    header.pack_end(&refresh_btn);
     header.pack_end(&spinner);
     window.set_titlebar(Some(&header));
 
@@ -178,42 +163,51 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 // Clear any active search
                 search_for_sidebar.set_text("");
                 status_for_sidebar.set_text(&format!(
-                    "Selected profile: {} \u{2014} click Index to load",
+                    "Selected profile: {} \u{2014} click Refresh to load",
                     profile
                 ));
             }
             "all-mail" => {
                 s.select_profile(&profile);
 
-                // Auto-index if DB not open for this maildir
+                // Open existing DB if available
                 if s.db.borrow().is_none() {
-                    match s.index_and_rebuild() {
-                        Ok(n) => status_for_sidebar.set_text(&format!(
-                            "Indexed {} messages, showing all for {}",
-                            n, profile
-                        )),
-                        Err(e) => status_for_sidebar.set_text(&format!("Error: {}", e)),
+                    let maildir = s.active_maildir.borrow().clone();
+                    if !maildir.as_os_str().is_empty() {
+                        let _ = s.open_db(&maildir);
                     }
-                } else {
-                    // DB already indexed — just show all
+                }
+                if s.db.borrow().is_some() {
                     match s.show_all() {
                         Ok(()) => status_for_sidebar.set_text(&format!(
                             "All mail for: {}", profile
                         )),
                         Err(e) => status_for_sidebar.set_text(&format!("Error: {}", e)),
                     }
+                } else {
+                    status_for_sidebar.set_text(&format!(
+                        "No index for {} \u{2014} click Refresh",
+                        profile
+                    ));
                 }
                 search_for_sidebar.set_text("");
             }
             "view" => {
                 s.select_profile(&profile);
 
-                // Auto-index if needed
+                // Open existing DB if available
                 if s.db.borrow().is_none() {
-                    if let Err(e) = s.index_and_rebuild() {
-                        status_for_sidebar.set_text(&format!("Error: {}", e));
-                        return;
+                    let maildir = s.active_maildir.borrow().clone();
+                    if !maildir.as_os_str().is_empty() {
+                        let _ = s.open_db(&maildir);
                     }
+                }
+                if s.db.borrow().is_none() {
+                    status_for_sidebar.set_text(&format!(
+                        "No index for {} \u{2014} click Refresh",
+                        profile
+                    ));
+                    return;
                 }
 
                 // Run the view's query
@@ -477,7 +471,7 @@ fn build_center_pane(root_model: &ListStore) -> (Box, SingleSelection, PreviewLa
     let date_label = Label::new(Some(""));
     date_label.set_xalign(0.0);
     let body_buffer = TextBuffer::new(None);
-    body_buffer.set_text("Select a profile, then click Index to load messages.");
+    body_buffer.set_text("Select a profile, then click Refresh to load messages.");
 
     let preview_labels = PreviewLabels {
         from_label,

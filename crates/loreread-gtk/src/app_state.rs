@@ -130,39 +130,6 @@ impl AppState {
 
     /// Index the active maildir and rebuild the thread tree.
     /// Used by the **Index** button (synchronous, main thread).
-    pub fn index_and_rebuild(&self) -> Result<usize, String> {
-        let maildir = self.active_maildir.borrow().clone();
-        if maildir.as_os_str().is_empty() {
-            return Err("no profile selected — pick a profile from the sidebar".to_string());
-        }
-
-        let need_open = self.db.borrow().is_none()
-            || self.db_maildir.borrow().as_path() != maildir.as_path();
-        if need_open {
-            self.open_db(&maildir)?;
-        }
-
-        let inserted = {
-            let db = self.db.borrow();
-            let conn = db.as_ref().ok_or("database not open")?;
-            loreread_core::indexer::index_maildir(conn, &maildir)
-                .map_err(|e| format!("indexing failed: {}", e))?
-        };
-
-        {
-            let db = self.db.borrow();
-            let conn = db.as_ref().ok_or("database not open")?;
-            let query_str = self.active_query.borrow();
-            if let Some(ref q) = *query_str {
-                self.rebuild_thread_tree_searched(&maildir, q)?;
-            } else {
-                self.rebuild_thread_tree(conn, &maildir)?;
-            }
-        }
-
-        Ok(inserted)
-    }
-
     /// Dispatch a Fetch command to the Lua thread (non-blocking).
     pub fn request_fetch(&self) -> Result<(), String> {
         let profile = self.active_profile.borrow().clone();
