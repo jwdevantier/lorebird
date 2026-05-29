@@ -175,6 +175,64 @@ pub fn read_raw_message(
     None
 }
 
+/// Read a raw message from the maildir and extract ALL headers
+/// as a `HashMap<String, String>`.
+///
+/// This is used by the reply compose flow to give the `on_reply`
+/// hook access to every header from the original message — no
+/// blocklisting, no filtering.
+pub fn read_raw_headers(
+    maildir_path: &std::path::Path,
+    filename: &str,
+) -> Option<std::collections::HashMap<String, String>> {
+    let raw = read_raw_bytes(maildir_path, filename)?;
+    let msg = mail_parser::MessageParser::default().parse(&raw)?;
+    let headers: std::collections::HashMap<String, String> = msg
+        .headers_raw()
+        .map(|(name, value)| (name.to_string(), value.trim().to_string()))
+        .collect();
+    Some(headers)
+}
+
+/// Read the raw bytes of a message file from the maildir.
+///
+/// Handles the same filename-resolution logic as `read_raw_message`.
+pub fn read_raw_bytes(maildir_path: &std::path::Path, filename: &str) -> Option<Vec<u8>> {
+    let full_path = maildir_path.join(filename);
+    let base = full_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(filename);
+
+    for subdir in &["cur", "new"] {
+        let candidate = maildir_path.join(subdir).join(base);
+
+        if candidate.exists() {
+            if let Ok(raw) = std::fs::read(&candidate) {
+                return Some(raw);
+            }
+        }
+
+        if let Ok(entries) = std::fs::read_dir(maildir_path.join(subdir)) {
+            for entry in entries.flatten() {
+                let entry_name = entry.file_name();
+                let entry_str = entry_name.to_string_lossy();
+                if entry_str.starts_with(base) {
+                    if let Ok(raw) = std::fs::read(&entry.path()) {
+                        return Some(raw);
+                    }
+                }
+            }
+        }
+    }
+
+    if full_path.exists() {
+        std::fs::read(&full_path).ok()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

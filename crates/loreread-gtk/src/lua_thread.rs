@@ -349,8 +349,8 @@ fn dirs_for_loreread() -> PathBuf {
 /// Handle a Reply command: call on_reply hook if present.
 ///
 /// If the hook is absent, return the pre-filled mail unchanged.
-/// If the hook returns a table, return the modified mail.
-/// If the hook returns nil, return the pre-filled mail unchanged.
+/// If the hook is present, it may modify `mail` in-place — we
+/// always extract the (potentially modified) result.
 fn handle_reply(
     state: &LuaState,
     profile_label: &str,
@@ -370,17 +370,10 @@ fn handle_reply(
 
     eprintln!("[loreread-lua]   calling on_reply for '{}'...", profile_label);
     match state.vm.call_on_reply(func, profile_label, parent, mail) {
-        Ok(Some(modified)) => {
+        Ok(modified) => {
             eprintln!("[loreread-lua]   on_reply returned modified mail");
             LuaResult::ReplyDone {
                 mail: Some(modified),
-                error: None,
-            }
-        }
-        Ok(None) => {
-            eprintln!("[loreread-lua]   on_reply returned nil — using default");
-            LuaResult::ReplyDone {
-                mail: None,
                 error: None,
             }
         }

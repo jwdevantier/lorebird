@@ -41,7 +41,9 @@ pub struct ComposeMail {
 
 /// Parent message data passed to the `on_reply` hook.
 ///
-/// Mirrors the `parent` table from the spec.
+/// Mirrors the `parent` table from the spec.  The `headers` map
+/// carries all significant headers from the original message so that
+/// hooks can inspect `Reply-To`, `List-Post`, `X-Mailer`, etc.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ParentMail {
     pub message_id: Option<String>,
@@ -55,6 +57,9 @@ pub struct ParentMail {
     pub references: String,
     pub in_reply_to: Option<String>,
     pub body_text: String,
+    /// All significant headers from the original message (name → value).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 // ── Reply construction ────────────────────────────────────────────────
@@ -331,6 +336,7 @@ mod tests {
             references: "<parent@def> <other@def>".to_string(),
             in_reply_to: Some("<parent@def>".to_string()),
             body_text: "This patch fixes...\n".to_string(),
+            headers: HashMap::new(),
         }
     }
 

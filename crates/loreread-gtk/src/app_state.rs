@@ -311,7 +311,7 @@ impl ThreadNodeTree {
             loreread_core::store::read_raw_message(maildir, &m.filename)
         });
 
-        let (from, to, cc, body, parsed_refs, parsed_date, parsed_mid) =
+        let (from, to, cc, body, parsed_refs, parsed_date, parsed_mid, parsed_irt) =
             if let Some(ref p) = parsed {
                 (
                     p.from_addr.clone().unwrap_or_default(),
@@ -321,12 +321,14 @@ impl ThreadNodeTree {
                     p.references.join(" "),
                     p.date_rfc3339.clone().unwrap_or_default(),
                     p.message_id.clone().unwrap_or_default(),
+                    p.in_reply_to.clone().unwrap_or_default(),
                 )
             } else {
                 (
                     msg.as_ref()
                         .and_then(|m| m.from_addr.clone())
                         .unwrap_or_default(),
+                    String::new(),
                     String::new(),
                     String::new(),
                     String::new(),
@@ -377,10 +379,21 @@ impl ThreadNodeTree {
         let last_reply_ts = Self::max_ts(t);
         let last_reply = format_relative_time(last_reply_ts);
 
+        let in_reply_to = if parsed_irt.is_empty() {
+            String::new()
+        } else {
+            parsed_irt
+        };
+
+        let filename = msg
+            .as_ref()
+            .map(|m| m.filename.clone())
+            .unwrap_or_default();
+
         let node = ThreadNode::new(
             &subject, &from, &to, &cc,
             &started, &last_reply, started_ts, last_reply_ts,
-            &message_id, &references_str, &date_str,
+            &message_id, &references_str, &in_reply_to, &date_str, &filename,
         );
         node.set_body_preview(body);
 

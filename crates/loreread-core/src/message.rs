@@ -12,6 +12,8 @@ use crate::thread;
 pub struct MailMessage {
     pub message_id: Option<String>,
     pub references: Vec<String>,
+    /// The In-Reply-To header value (single message-id).
+    pub in_reply_to: Option<String>,
     pub subject: Option<String>,
     pub from_addr: Option<String>,
     pub to_addr: Option<String>,
@@ -33,12 +35,13 @@ impl MailMessage {
             .references()
             .iter_ids()
             .map(|s| s.to_string())
-            .chain(
-                msg.in_reply_to()
-                    .iter_ids()
-                    .map(|s| s.to_string()),
-            )
             .collect::<Vec<_>>();
+
+        let in_reply_to = msg
+            .in_reply_to()
+            .iter_ids()
+            .last()
+            .map(|s| s.to_string());
 
         // Deduplicate while preserving order
         let mut seen = std::collections::HashSet::new();
@@ -67,6 +70,7 @@ impl MailMessage {
         Some(Self {
             message_id,
             references,
+            in_reply_to,
             subject,
             from_addr,
             to_addr,

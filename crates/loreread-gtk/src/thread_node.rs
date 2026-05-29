@@ -6,9 +6,8 @@
 //! discover them.
 //!
 //! Two timestamp properties track thread activity:
-//! - `started-ts`: unix timestamp of the thread's root message
+//! - `started-ts`: unix timestamp of the root message
 //! - `last-reply-ts`: unix timestamp of the most recent message
-//!   in the thread (including the root itself)
 //!
 //! The display strings (`started`, `last-reply`) are relative-time
 //! labels like "2h ago" derived from the timestamps at creation time.
@@ -53,9 +52,15 @@ mod imp {
         /// Space-separated References header value (for threading Replies).
         #[property(get, set)]
         references_str: RefCell<String>,
+        /// The In-Reply-To header value (single message-id).
+        #[property(get, set)]
+        in_reply_to: RefCell<String>,
         /// Formatted date string (for quote attribution: "On , wrote:").
         #[property(get, set)]
         date_str: RefCell<String>,
+        /// Filename of the message in the maildir (for re-reading raw headers).
+        #[property(get, set)]
+        filename: RefCell<String>,
         /// Children list — not a GObject property, only used by
         /// `TreeListModel` to discover child rows.
         pub children: OnceCell<ListStore>,
@@ -77,6 +82,7 @@ glib::wrapper! {
 
 impl ThreadNode {
     /// Create a new thread node.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         subject: &str,
         from_addr: &str,
@@ -88,7 +94,9 @@ impl ThreadNode {
         last_reply_ts: i64,
         message_id: &str,
         references_str: &str,
+        in_reply_to: &str,
         date_str: &str,
+        filename: &str,
     ) -> Self {
         glib::Object::builder()
             .property("subject", subject)
@@ -103,7 +111,9 @@ impl ThreadNode {
             .property("body-preview", String::new())
             .property("message-id", message_id)
             .property("references-str", references_str)
+            .property("in-reply-to", in_reply_to)
             .property("date-str", date_str)
+            .property("filename", filename)
             .build()
     }
 

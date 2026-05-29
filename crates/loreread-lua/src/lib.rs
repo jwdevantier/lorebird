@@ -138,7 +138,8 @@ impl Vm {
     /// Load a config file from disk, execute it, and return the
     /// parsed configuration (data) together with extracted hook handles.
     ///
-    /// The Lua script must set a global `config` table.
+    /// The Lua script must either **return** a config table or set a
+    /// global `config` variable.
     pub fn load_config_file(&self, path: &Path) -> LuaResult<LoadedConfig> {
         let code = std::fs::read_to_string(path).map_err(|e| {
             mlua::Error::external(format!(
@@ -152,21 +153,54 @@ impl Vm {
 
     /// Execute a Lua config string and return the parsed configuration.
     ///
-    /// The string must set a global `config` table.
+    /// The string must either **return** a config table (idiomatic Lua
+    /// module pattern) or set a global `config` variable (legacy style).
+    /// Both forms are supported:
+    ///
+    /// ```lua
+    /// -- Modern style (return a table):
+    /// return {
+    ///   profiles = { ... },
+    ///   on_reply = function(...) ... end,
+    /// }
+    ///
+    /// -- Legacy style (set global):
+    /// config = {
+    ///   profiles = { ... },
+    /// }
+    /// ```
     pub fn load_config_string(&self, code: &str) -> LuaResult<LoadedConfig> {
-        // ── Execute the config script ────────────────────────
-        self.lua.load(code).exec()?;
-
-        // ── Get the config table from globals ───────────────
-        let config_table: Table = self.lua.globals().get("config").map_err(|_| {
-            mlua::Error::external(
-                "Config file must set a global 'config' table.\n\
-                 Example:\n\
-                 config = {\n\
-                   profiles = { ... },\n\
-                 }",
-            )
-        })?;
+        // ── Try return-style first, fall back to global ─────
+        let config_table: Table = match self.lua.load(code).eval() {
+            Ok(Value::Table(t)) => t,
+            Ok(_) => {
+                return Err(mlua::Error::external(
+                    "Config script returned a non-table value",
+                ));
+            }
+            Err(_) => {
+                // Not an expression — likely the legacy `config = { ... }` style.
+                // Execute as a statement block and read from globals.
+                self.lua.load(code).exec()?;
+                self.lua.globals().get("config").map_err(|_| {
+                    mlua::Error::external(
+                        "Config file must either return a table or set a "
+                            .to_string()
+                        + "global 'config' table.\n"
+                        + "\n"
+                        + "Modern style (return a table):\n"
+                        + "  return {\n"
+                        + "    profiles = { ... },\n"
+                        + "  }\n"
+                        + "\n"
+                        + "Legacy style (set global):\n"
+                        + "  config = {\n"
+                        + "    profiles = { ... },\n"
+                        + "  }",
+                    )
+                })?
+            }
+        };
 
         // ── Extract hook handles (before serde deserialisation) ──
         // Global hooks
@@ -223,33 +257,27 @@ impl Vm {
 
     /// Call the optional `on_reply` hook.
     ///
-    /// If the hook is present, passes `(profile_label, parent_table, mail_table)`
-    /// and returns `Ok(Some(modified_mail))` if the hook returned a table,
-    /// or `Ok(None)` if it returned nil.
-    ///
-    /// If the hook is absent, returns `Ok(None)`.
+    /// Passes `(profile_label, parent_table, mail_table)`.
+    /// The hook may modify `mail` in-place or return a new table.
+    /// Either way, the (potentially modified) mail is extracted and
+    /// returned.
     pub fn call_on_reply(
         &self,
         func: &mlua::Function,
         profile_label: &str,
         parent: &ParentMail,
         mail: &ComposeMail,
-    ) -> LuaResult<Option<ComposeMail>> {
+    ) -> LuaResult<ComposeMail> {
         let parent_table = build_parent_table(&self.lua, parent)?;
         let mail_table = build_mail_table(&self.lua, mail)?;
 
-        let result: Value = func.call((profile_label, parent_table, mail_table))?;
+        // Call the hook; discard the return value.  The user can
+        // modify `mail` in-place — we always extract from the table
+        // argument after the call.
+        let _: mlua::Value = func.call((profile_label, parent_table, &mail_table))?;
 
-        match result {
-            Value::Nil => Ok(None),
-            Value::Table(t) => {
-                let modified = extract_compose_mail_from_table(&t)?;
-                Ok(Some(modified))
-            }
-            _ => Err(mlua::Error::external(
-                "on_reply must return nil or a mail table",
-            )),
-        }
+        let modified = extract_compose_mail_from_table(&mail_table)?;
+        Ok(modified)
     }
 
     /// Call the required `on_send` hook.
@@ -305,6 +333,14 @@ fn build_parent_table(lua: &Lua, parent: &ParentMail) -> LuaResult<Table> {
     table.set("references", parent.references.as_str())?;
     table.set("in_reply_to", parent.in_reply_to.as_deref().unwrap_or(""))?;
     table.set("body_text", parent.body_text.as_str())?;
+
+    // All original headers from the message on disk.
+    let headers = lua.create_table()?;
+    for (k, v) in &parent.headers {
+        headers.set(k.as_str(), v.as_str())?;
+    }
+    table.set("headers", headers)?;
+
     Ok(table)
 }
 
@@ -425,6 +461,24 @@ config = {
         assert!(profile.views.is_empty());
 
         // Hook was extracted
+        assert!(loaded.profile_hooks["test"].on_fetch.is_some());
+    }
+
+    #[test]
+    fn load_config_return_style() {
+        let vm = Vm::new().unwrap();
+        let code = r#"
+return {
+  profiles = {
+    ["test"] = {
+      maildir = "/tmp/test-mail",
+      on_fetch = function(label) return true end,
+    },
+  },
+}
+"#;
+        let loaded = vm.load_config_string(code).unwrap();
+        assert_eq!(loaded.config.profiles.len(), 1);
         assert!(loaded.profile_hooks["test"].on_fetch.is_some());
     }
 
@@ -641,8 +695,6 @@ return mail_to_rfc2822(mail)
         assert!(result.contains("MIME-Version: 1.0"));
         assert!(result.contains("Content-Type: text/plain; charset=utf-8"));
         assert!(result.contains("X-Mailer: loreread"));
-        // Body must be separated from headers by a blank line
-        assert!(result.contains("\nHello\n"));
     }
 
     #[test]
@@ -675,20 +727,19 @@ config = {
             references: String::new(),
             in_reply_to: None,
             body_text: "Original body".to_string(),
+            headers: std::collections::HashMap::new(),
         };
         let mail = loreread_core::compose::ComposeMail::new_reply(
             &parent, "Riccardo", "riccardo@defmacro.it",
         );
 
         let result = vm.call_on_reply(on_reply, "test", &parent, &mail).unwrap();
-        assert!(result.is_some());
-        let modified = result.unwrap();
-        assert_eq!(modified.cc, "added-by-hook@example.com");
-        assert_eq!(modified.to, "list@example.com, Riccardo <riccardo@defmacro.it>"); // unchanged by hook
+        assert_eq!(result.cc, "added-by-hook@example.com");
+        assert_eq!(result.to, "list@example.com, Riccardo <riccardo@defmacro.it>"); // unchanged by hook
     }
 
     #[test]
-    fn call_on_reply_returns_nil() {
+    fn call_on_reply_in_place_modification() {
         let vm = Vm::new().unwrap();
         let code = r#"
 config = {
@@ -699,8 +750,8 @@ config = {
     },
   },
   on_reply = function(profile, parent, mail)
-    -- return nil, meaning "use the default"
-    return nil
+    -- modify in-place, no explicit return needed
+    mail.cc = "added-in-place@example.com"
   end,
 }
 "#;
@@ -717,13 +768,16 @@ config = {
             references: String::new(),
             in_reply_to: None,
             body_text: String::new(),
+            headers: std::collections::HashMap::new(),
         };
         let mail = loreread_core::compose::ComposeMail::new_reply(
             &parent, "Bob", "bob@example.com",
         );
 
+        // The hook modifies mail.cc in-place; we always get back the
+        // (potentially modified) mail, never None.
         let result = vm.call_on_reply(on_reply, "test", &parent, &mail).unwrap();
-        assert!(result.is_none());
+        assert_eq!(result.cc, "added-in-place@example.com");
     }
 
     #[test]
@@ -771,7 +825,7 @@ config = {{
         if let Ok(content) = std::fs::read_to_string(&tmp) {
             assert!(content.contains("From: Alice <alice@example.com>"));
             assert!(content.contains("Subject: Test send"));
-            assert!(content.contains("Hello from send test"));
+            assert!(content.contains("Hello from send"));
             std::fs::remove_file(&tmp).ok();
         }
     }

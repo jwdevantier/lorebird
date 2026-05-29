@@ -5,6 +5,7 @@
 //! row sets the active profile (and optionally the view query).
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -449,7 +450,17 @@ fn trigger_reply(
         }
     };
 
-    // Build ParentMail from the selected node
+    // Build ParentMail from the selected node, including ALL original
+    // headers read from disk so the on_reply hook can inspect any header.
+    let filename = node.filename();
+    let maildir = s.active_maildir.borrow().clone();
+    let headers = if !filename.is_empty() {
+        loreread_core::store::read_raw_headers(&maildir, &filename)
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
     let parent = loreread_core::compose::ParentMail {
         message_id: {
             let mid = node.message_id();
@@ -461,8 +472,12 @@ fn trigger_reply(
         subject: node.subject(),
         date: node.date_str(),
         references: node.references_str(),
-        in_reply_to: None, // not stored separately; references chain covers it
+        in_reply_to: {
+            let irt = node.in_reply_to();
+            if irt.is_empty() { None } else { Some(irt) }
+        },
         body_text: node.body_preview(),
+        headers,
     };
 
     // Build pre-filled reply
