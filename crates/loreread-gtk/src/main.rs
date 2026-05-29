@@ -1,5 +1,6 @@
 mod app_state;
 mod folder_item;
+mod lua_thread;
 mod thread_node;
 mod window;
 
@@ -17,8 +18,7 @@ fn main() {
         .build();
 
     app.connect_activate(|app| {
-        // Look for --config <path> on the command line,
-        // otherwise fall back to default location.
+        // Look for --config <path> on the command line
         let config_path = std::env::args()
             .collect::<Vec<_>>()
             .windows(2)

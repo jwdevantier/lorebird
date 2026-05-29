@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gio::ListStore;
 use glib::Object;
@@ -13,7 +14,7 @@ use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box, ColumnView, ColumnViewColumn, Grid, HeaderBar, IconSize,
     Image, Label, ListBoxRow, ListItem, Orientation, Paned, PolicyType, SearchEntry,
-    ScrolledWindow, SignalListItemFactory, SingleSelection,
+    ScrolledWindow, SignalListItemFactory, SingleSelection, Spinner,
     TextBuffer, TextView, TreeExpander, TreeListModel, TreeListRow, WrapMode,
 };
 
@@ -43,6 +44,10 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let fetch_btn = gtk4::Button::with_label("Fetch");
     let index_btn = gtk4::Button::with_label("Index");
 
+    // ── Spinner (shown during async fetch) ─────────────────────
+    let spinner = Spinner::new();
+    spinner.set_spinning(false);
+
     // ── Status bar (created early so callbacks can clone it) ──
     let status_label = Label::new(Some("Ready \u{2014} select a profile, then click Index"));
     status_label.set_margin_start(8);
@@ -69,28 +74,34 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         }
     });
 
-    // ── Wire Fetch button ─────────────────────────────────────
+    // ── Wire Fetch button (async via Lua thread) ─────────────────
     let state_for_fetch = state.clone();
     let status_for_fetch = status_label.clone();
+    let spinner_for_fetch = spinner.clone();
     fetch_btn.connect_clicked(move |_btn| {
         let s = state_for_fetch.borrow();
-        match s.call_fetch_hook() {
-            Ok(true) => {
-                status_for_fetch.set_text("Fetch succeeded, indexing\u{2026}");
-                match s.index_and_rebuild() {
-                    Ok(n) => {
-                        status_for_fetch.set_text(&format!(
-                            "Fetched & indexed {} new messages",
-                            n
-                        ));
+        match s.request_fetch() {
+            Ok(()) => {
+                spinner_for_fetch.set_spinning(true);
+                status_for_fetch.set_text("Fetching\u{2026}");
+                // Poll for result in the main loop
+                let state_poll = state_for_fetch.clone();
+                let status_poll = status_for_fetch.clone();
+                let spinner_poll = spinner_for_fetch.clone();
+                glib::timeout_add_local(Duration::from_millis(100), move || {
+                    let s = state_poll.borrow();
+                    match s.poll_fetch_result() {
+                        Some(result) => {
+                            spinner_poll.set_spinning(false);
+                            match s.handle_fetch_result(&result) {
+                                Ok(msg) => status_poll.set_text(&msg),
+                                Err(e) => status_poll.set_text(&format!("Fetch error: {}", e)),
+                            }
+                            glib::ControlFlow::Break
+                        }
+                        None => glib::ControlFlow::Continue,
                     }
-                    Err(e) => {
-                        status_for_fetch.set_text(&format!("Indexing error: {}", e));
-                    }
-                }
-            }
-            Ok(false) => {
-                status_for_fetch.set_text("Fetch hook returned false \u{2014} no new mail");
+                });
             }
             Err(e) => {
                 status_for_fetch.set_text(&format!("Fetch error: {}", e));
@@ -100,6 +111,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     header.pack_end(&index_btn);
     header.pack_end(&fetch_btn);
+    header.pack_end(&spinner);
     window.set_titlebar(Some(&header));
 
     // ── Main vertical box: paned + status ──────────────────────

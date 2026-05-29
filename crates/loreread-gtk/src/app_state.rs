@@ -1,8 +1,9 @@
 //! Application state — database connection, config, thread data.
 //!
 //! `AppState` is the shared mutable state that the GUI reads and writes.
-//! It holds the SQLite connection, the loaded config, and the root
-//! list-store of `ThreadNode`s that backs the `ColumnView`.
+//! It holds the SQLite connection (main-thread reads), the root
+//! list-store of `ThreadNode`s, and a handle to the background Lua
+//! thread.  See `specs/threading.md` for the full architecture.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -11,14 +12,15 @@ use std::path::PathBuf;
 use gio::ListStore;
 use rusqlite::Connection;
 
+use crate::lua_thread::{LuaCommand, LuaResult, LuaThread};
 use crate::thread_node::ThreadNode;
 use loreread_core::store::DbMessage;
 use loreread_core::thread::{self, Thread};
-use loreread_lua::{AppConfig, LoadedConfig, ResolvedProfile, Vm};
+use loreread_lua::ResolvedProfile;
 
 /// Central application state, shared between the window and action callbacks.
 pub struct AppState {
-    /// SQLite connection to the mail index database.
+    /// SQLite connection for reads (main thread only).
     pub db: RefCell<Option<Connection>>,
 
     /// Path to the DB's associated maildir (empty = no DB open).
@@ -33,93 +35,27 @@ pub struct AppState {
     /// Path to the maildir of the currently active profile.
     pub active_maildir: RefCell<PathBuf>,
 
-    /// Optional active view query (when a view is selected rather
-    /// than "All Mail").
+    /// Optional active view query.
     pub active_query: RefCell<Option<String>>,
 
-    /// Lua VM — kept alive so that hook handles remain valid.
-    pub vm: Vm,
+    /// Handle to the background Lua thread (owns Vm + LoadedConfig).
+    pub lua_thread: LuaThread,
 
-    /// Loaded configuration (resolved profiles + hooks).
-    pub config: LoadedConfig,
-
-    /// Resolved profiles (keyed by label), derived from config.
+    /// Resolved profiles (keyed by label), snapshot from config.
     pub profiles: HashMap<String, ResolvedProfile>,
 }
 
 impl AppState {
-    /// Create a new `AppState`, loading config from `config_path`
-    /// (or a default location).  Falls back to an empty config if
-    /// the file cannot be loaded.
+    /// Create a new `AppState` by spawning the Lua thread and
+    /// receiving the resolved profiles from it.
     pub fn new(config_path: Option<&std::path::Path>) -> Self {
-        let vm = Vm::new().expect("failed to create Lua VM");
-        let (config, profiles) = match config_path {
-            Some(path) => match vm.load_config_file(path) {
-                Ok(loaded) => {
-                    let resolved = loaded.config.resolve_all();
-                    eprintln!(
-                        "[loreread] loaded config: {} profile(s) from {}",
-                        resolved.len(),
-                        path.display()
-                    );
-                    (loaded, resolved)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[loreread] warning: failed to load config from {}: {}",
-                        path.display(),
-                        e
-                    );
-                    let empty_config = AppConfig {
-                        user: None,
-                        profiles: HashMap::new(),
-                    };
-                    let loaded = LoadedConfig {
-                        config: empty_config.clone(),
-                        profile_hooks: HashMap::new(),
-                        global_hooks: loreread_lua::GlobalHooks {
-                            on_reply: None,
-                            on_send: None,
-                        },
-                    };
-                    (loaded, empty_config.resolve_all())
-                }
-            },
-            None => {
-                // Try default location: ~/.config/loreread/config.lua
-                let default = dirs_for_loreread();
-                let cfg_file = default.join("config.lua");
-                if cfg_file.exists() {
-                    match vm.load_config_file(&cfg_file) {
-                        Ok(loaded) => {
-                            let resolved = loaded.config.resolve_all();
-                            eprintln!(
-                                "[loreread] loaded config: {} profile(s) from {}",
-                                resolved.len(),
-                                cfg_file.display()
-                            );
-                            (loaded, resolved)
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[loreread] warning: failed to load config from {}: {}",
-                                cfg_file.display(),
-                                e
-                            );
-                            let empty = empty_config();
-                            let resolved = empty.config.resolve_all();
-                            (empty, resolved)
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "[loreread] no config found at {} — using empty config",
-                        cfg_file.display()
-                    );
-                    let empty = empty_config();
-                    let resolved = empty.config.resolve_all();
-                    (empty, resolved)
-                }
+        let lua_thread = LuaThread::spawn(config_path.map(|p| p.to_path_buf()));
+
+        let profiles = match lua_thread.recv_init() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[loreread] warning: {}", e);
+                HashMap::new()
             }
         };
 
@@ -130,23 +66,18 @@ impl AppState {
             active_profile: RefCell::new(String::new()),
             active_maildir: RefCell::new(PathBuf::new()),
             active_query: RefCell::new(None),
-            vm,
-            config,
+            lua_thread,
             profiles,
         }
     }
 
-    /// Select a profile by label: sets `active_profile` and `active_maildir`.
-    /// If the maildir differs from the currently-open DB, the DB will be
-    /// re-opened on next index.
+    /// Select a profile by label.
     pub fn select_profile(&self, label: &str) {
         if let Some(profile) = self.profiles.get(label) {
             *self.active_profile.borrow_mut() = label.to_string();
             *self.active_maildir.borrow_mut() = profile.maildir.clone();
             *self.active_query.borrow_mut() = None;
 
-            // If DB is open for a different maildir, close it
-            // so the next index_and_rebuild() will re-open.
             let current_db_dir = self.db_maildir.borrow().clone();
             if current_db_dir != profile.maildir {
                 *self.db.borrow_mut() = None;
@@ -155,14 +86,11 @@ impl AppState {
     }
 
     /// Select a view within the current profile.
-    /// Sets `active_query` to the view's query string.
     pub fn select_view(&self, query: String) {
         *self.active_query.borrow_mut() = Some(query);
     }
 
-
-    /// Run a search query and rebuild the thread tree filtered to
-    /// only those threads containing at least one match.
+    /// Run a search query and rebuild the thread tree.
     pub fn search(&self, query: &str) -> Result<usize, String> {
         let maildir = self.active_maildir.borrow().clone();
         if maildir.as_os_str().is_empty() {
@@ -171,11 +99,10 @@ impl AppState {
         if self.db.borrow().is_none() {
             return Err("no database open — click Index first".to_string());
         }
-
         self.rebuild_thread_tree_searched(&maildir, query)
     }
 
-    /// Clear search results and show all messages again.
+    /// Clear search results and show all messages.
     pub fn show_all(&self) -> Result<(), String> {
         let maildir = self.active_maildir.borrow().clone();
         if maildir.as_os_str().is_empty() {
@@ -184,16 +111,12 @@ impl AppState {
         if self.db.borrow().is_none() {
             return Err("no database open — click Index first".to_string());
         }
-
         let db = self.db.borrow();
         let conn = db.as_ref().ok_or("database not open")?;
         self.rebuild_thread_tree(conn, &maildir)
     }
 
     /// Open (or create) the index database for `maildir`.
-    ///
-    /// The database is stored at `{maildir}/.loreread.db`.
-    /// Creates the schema if the file does not yet exist.
     pub fn open_db(&self, maildir: &std::path::Path) -> Result<(), String> {
         let db_path = maildir.join(".loreread.db");
         let conn = Connection::open(&db_path)
@@ -206,22 +129,19 @@ impl AppState {
     }
 
     /// Index the active maildir and rebuild the thread tree.
-    ///
-    /// Returns the number of newly indexed messages, or an error string.
+    /// Used by the **Index** button (synchronous, main thread).
     pub fn index_and_rebuild(&self) -> Result<usize, String> {
         let maildir = self.active_maildir.borrow().clone();
         if maildir.as_os_str().is_empty() {
             return Err("no profile selected — pick a profile from the sidebar".to_string());
         }
 
-        // Open DB if needed
         let need_open = self.db.borrow().is_none()
             || self.db_maildir.borrow().as_path() != maildir.as_path();
         if need_open {
             self.open_db(&maildir)?;
         }
 
-        // Index (needs exclusive borrow of conn)
         let inserted = {
             let db = self.db.borrow();
             let conn = db.as_ref().ok_or("database not open")?;
@@ -229,12 +149,9 @@ impl AppState {
                 .map_err(|e| format!("indexing failed: {}", e))?
         };
 
-        // Rebuild thread tree (separate borrow)
         {
             let db = self.db.borrow();
             let conn = db.as_ref().ok_or("database not open")?;
-
-            // If a view query is active, filter to matching threads
             let query_str = self.active_query.borrow();
             if let Some(ref q) = *query_str {
                 self.rebuild_thread_tree_searched(&maildir, q)?;
@@ -246,6 +163,65 @@ impl AppState {
         Ok(inserted)
     }
 
+    /// Dispatch a Fetch command to the Lua thread (non-blocking).
+    pub fn request_fetch(&self) -> Result<(), String> {
+        let profile = self.active_profile.borrow().clone();
+        let maildir = self.active_maildir.borrow().clone();
+        if profile.is_empty() {
+            return Err("no profile selected".to_string());
+        }
+        self.lua_thread
+            .send(LuaCommand::Fetch { profile_label: profile, maildir })
+            .map_err(|e| format!("failed to send fetch command: {}", e))
+    }
+
+    /// Check if the Lua thread has a result (non-blocking).
+    pub fn poll_fetch_result(&self) -> Option<LuaResult> {
+        self.lua_thread.try_recv().ok()
+    }
+
+    /// Process a completed fetch result on the main thread.
+    /// Re-opens the DB and rebuilds the thread tree.
+    pub fn handle_fetch_result(&self, result: &LuaResult) -> Result<String, String> {
+        match result {
+            LuaResult::FetchDone { profile_label: _, indexed_count, error } => {
+                if let Some(e) = error {
+                    return Err(e.clone());
+                }
+
+                let maildir = self.active_maildir.borrow().clone();
+                if maildir.as_os_str().is_empty() {
+                    return Err("no profile selected".to_string());
+                }
+
+                // Re-open DB to pick up new data indexed by the Lua thread
+                *self.db.borrow_mut() = None;
+                self.open_db(&maildir)?;
+
+                {
+                    let db = self.db.borrow();
+                    let conn = db.as_ref().ok_or("database not open")?;
+                    let query_str = self.active_query.borrow();
+                    if let Some(ref q) = *query_str {
+                        self.rebuild_thread_tree_searched(&maildir, q)?;
+                    } else {
+                        self.rebuild_thread_tree(conn, &maildir)?;
+                    }
+                }
+
+                if *indexed_count == 0 {
+                    Ok("Fetch succeeded — no new mail".to_string())
+                } else {
+                    Ok(format!("Fetched & indexed {} new messages", indexed_count))
+                }
+            }
+            LuaResult::InitDone { .. } | LuaResult::InitFailed { .. } => {
+                // Init results are handled synchronously in AppState::new()
+                Err("unexpected init result in fetch handler".to_string())
+            }
+        }
+    }
+
     /// Rebuild the thread tree from the database (all messages).
     pub fn rebuild_thread_tree(
         &self,
@@ -254,7 +230,6 @@ impl AppState {
     ) -> Result<(), String> {
         let messages = loreread_core::store::load_all_messages(conn)
             .map_err(|e| format!("query failed: {}", e))?;
-
         let threads = thread::thread_messages(messages);
 
         self.root_model.remove_all();
@@ -262,27 +237,10 @@ impl AppState {
         for root_node in &node_tree.roots {
             self.root_model.append(root_node);
         }
-
         Ok(())
     }
 
-    /// Call the on_fetch Lua hook for the active profile.
-    /// Returns `Ok(true)` if the hook succeeded and wants re-indexing,
-    /// `Ok(false)` if it returned falsy, `Err` on failure.
-    pub fn call_fetch_hook(&self) -> Result<bool, String> {
-        let label = self.active_profile.borrow().clone();
-        if label.is_empty() {
-            return Err("no profile selected".to_string());
-        }
-        let hooks = self.config.profile_hooks.get(&label)
-            .ok_or_else(|| format!("no hooks for profile '{}'", label))?;
-        self.vm.call_on_fetch(&label, hooks)
-            .map_err(|e| format!("on_fetch hook failed: {}", e))
-    }
-
-    /// Rebuild the thread tree filtered by a search query.
-    /// Uses the approach from tools/mail-query: thread ALL messages,
-    /// then show only the root threads containing matches.
+    /// Rebuild thread tree filtered by search query.
     fn rebuild_thread_tree_searched(
         &self,
         maildir: &std::path::Path,
@@ -295,17 +253,14 @@ impl AppState {
         let db = self.db.borrow();
         let conn = db.as_ref().ok_or("database not open")?;
 
-        // 1. Get matching message IDs from FTS5
         let matched_ids: Vec<String> = loreread_core::query::search(conn, &pq)
             .map_err(|e| format!("search failed: {}", e))?;
         let match_count = matched_ids.len();
 
-        // 2. Thread ALL messages
         let all_messages = loreread_core::store::load_all_messages(conn)
             .map_err(|e| format!("query failed: {}", e))?;
         let threads = thread::thread_messages(all_messages);
 
-        // 3. Map matching IDs &rarr; root-thread indices
         let thread_index = thread::build_thread_index(&threads);
         let mut seen_threads: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for id in &matched_ids {
@@ -314,11 +269,8 @@ impl AppState {
             }
         }
 
-        // 4. Display only threads that contain matches
         self.root_model.remove_all();
-        let node_tree = ThreadNodeTree::from_threads_filtered(
-            &threads, maildir, &seen_threads,
-        );
+        let node_tree = ThreadNodeTree::from_threads_filtered(&threads, maildir, &seen_threads);
         for root_node in &node_tree.roots {
             self.root_model.append(root_node);
         }
@@ -329,45 +281,12 @@ impl AppState {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn empty_config() -> LoadedConfig {
-    LoadedConfig {
-        config: AppConfig {
-            user: None,
-            profiles: HashMap::new(),
-        },
-        profile_hooks: HashMap::new(),
-        global_hooks: loreread_lua::GlobalHooks {
-            on_reply: None,
-            on_send: None,
-        },
-    }
-}
-
-/// Return the XDG config directory for loreread.
-fn dirs_for_loreread() -> PathBuf {
-    // Use xdg config dir, falling back to ~/.config
-    std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs_sys_config()
-        })
-        .join("loreread")
-}
-
-fn dirs_sys_config() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".config")
-}
-
-/// Intermediate tree of `ThreadNode` GObjects built from
-/// `Thread<DbMessage>`.
+/// Intermediate tree of `ThreadNode` GObjects.
 struct ThreadNodeTree {
     roots: Vec<ThreadNode>,
 }
 
 impl ThreadNodeTree {
-    /// Recursively convert `Thread<DbMessage>` objects into
-    /// `ThreadNode` GObjects with display-friendly date strings.
     fn from_threads(threads: &[Thread<DbMessage>], maildir: &std::path::Path) -> Self {
         let roots: Vec<ThreadNode> = threads
             .iter()
@@ -376,9 +295,6 @@ impl ThreadNodeTree {
         Self { roots }
     }
 
-    /// Like `from_threads`, but only include root threads whose index
-    /// appears in `seen_threads`.  Used for search filtering: display
-    /// only threads that contain at least one matching message.
     fn from_threads_filtered(
         threads: &[Thread<DbMessage>],
         maildir: &std::path::Path,
@@ -438,30 +354,20 @@ impl ThreadNodeTree {
     }
 }
 
-/// Format a Unix timestamp as a human-readable relative time string
-/// (e.g. "3d ago", "2h ago", "1w ago").
 fn format_relative_time(ts: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     let diff = now - ts;
-    if diff < 0 {
-        return "just now".to_string();
-    }
+    if diff < 0 { return "just now".to_string(); }
     let mins = diff / 60;
     let hours = diff / 3600;
     let days = diff / 86400;
     let weeks = diff / (7 * 86400);
-    if weeks > 0 {
-        format!("{}w ago", weeks)
-    } else if days > 0 {
-        format!("{}d ago", days)
-    } else if hours > 0 {
-        format!("{}h ago", hours)
-    } else if mins > 0 {
-        format!("{}m ago", mins)
-    } else {
-        "just now".to_string()
-    }
+    if weeks > 0 { format!("{}w ago", weeks) }
+    else if days > 0 { format!("{}d ago", days) }
+    else if hours > 0 { format!("{}h ago", hours) }
+    else if mins > 0 { format!("{}m ago", mins) }
+    else { "just now".to_string() }
 }
