@@ -55,11 +55,19 @@ pub struct AppConfig {
     /// "light" or "dark".  Defaults to "light".
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// UI scale factor (1.0 = no scaling).  Applied as a multiplier to
+    /// the GTK Xft DPI setting.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f64,
     pub profiles: HashMap<String, ProfileData>,
 }
 
 fn default_theme() -> String {
     "light".to_string()
+}
+
+fn default_ui_scale() -> f64 {
+    1.0
 }
 
 // ── Hook types (Lua function handles) ──────────────────────────────
@@ -222,6 +230,7 @@ mod tests {
                 email: Some("default@example.com".to_string()),
             }),
             theme: "light".to_string(),
+            ui_scale: 1.0,
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(

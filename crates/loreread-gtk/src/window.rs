@@ -43,6 +43,18 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         .default_height(700)
         .build();
 
+    // ── Apply UI scale ──────────────────────────────────────────
+    // Multiply the Xft DPI by the user's scale factor (default 1.0).
+    // A value of 1.0 means no change; 2.0 doubles the DPI, etc.
+    // Only applied if ui_scale differs from 1.0, so unconfigured
+    // environments are left untouched.
+    let scale = state_ref.ui_scale;
+    if scale != 1.0 {
+        let ws = window.settings();
+        let dpi = ws.gtk_xft_dpi();
+        ws.set_gtk_xft_dpi((scale * dpi as f64) as i32);
+    }
+
     // ── Header bar ────────────────────────────────────────────
     let header = HeaderBar::new();
     let title_label = Label::new(Some("loreread"));

@@ -46,6 +46,10 @@ pub struct AppState {
 
     /// Theme preference from config: "light" or "dark".
     pub theme: String,
+
+    /// UI scale factor from config (default 1.0).  Multiplied against
+    /// the GTK Xft DPI to adjust for HiDPI / broken environments.
+    pub ui_scale: f64,
 }
 
 impl AppState {
@@ -61,6 +65,7 @@ impl AppState {
                 InitResult {
                     profiles: HashMap::new(),
                     theme: "light".to_string(),
+                    ui_scale: 1.0,
                 }
             }
         };
@@ -75,6 +80,7 @@ impl AppState {
             lua_thread,
             profiles: init.profiles,
             theme: init.theme,
+            ui_scale: init.ui_scale,
         }
     }
 
