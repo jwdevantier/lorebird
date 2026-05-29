@@ -15,8 +15,10 @@ use gtk4::{
     Application, ApplicationWindow, Box, ColumnView, ColumnViewColumn, Grid, HeaderBar, IconSize,
     Image, Label, ListBoxRow, ListItem, Orientation, Paned, PolicyType, SearchEntry,
     ScrolledWindow, SignalListItemFactory, SingleSelection, Spinner,
-    TextBuffer, TextView, TreeExpander, TreeListModel, TreeListRow, WrapMode,
+    TreeExpander, TreeListModel, TreeListRow, WrapMode,
 };
+use sourceview5 as sv;
+use sourceview5::prelude::*;
 
 use crate::app_state::AppState;
 use crate::folder_item::FolderItem;
@@ -238,16 +240,16 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
             let body = node.body_preview();
             if body.is_empty() {
-                pl.body_buffer.set_text("(no preview available)");
+                set_body_with_highlight(&pl.body_buffer, "(no preview available)");
             } else {
-                pl.body_buffer.set_text(&body);
+                set_body_with_highlight(&pl.body_buffer, &body);
             }
             return;
         }
         pl.from_label.set_text("");
         pl.subject_label.set_text("");
         pl.date_label.set_text("");
-        pl.body_buffer.set_text("");
+        set_body_with_highlight(&pl.body_buffer, "");
     });
 
     // ── Wire search bar ──────────────────────────────────────────
@@ -436,7 +438,7 @@ pub(crate) struct PreviewLabels {
     pub from_label: Label,
     pub subject_label: Label,
     pub date_label: Label,
-    pub body_buffer: TextBuffer,
+    pub body_buffer: sv::Buffer,
 }
 
 /// Build the centre pane, returning the root widget, the selection model
@@ -470,8 +472,16 @@ fn build_center_pane(root_model: &ListStore) -> (Box, SingleSelection, PreviewLa
     subject_label.set_xalign(0.0);
     let date_label = Label::new(Some(""));
     date_label.set_xalign(0.0);
-    let body_buffer = TextBuffer::new(None);
+    let body_buffer = sv::Buffer::new(None::<&gtk4::TextTagTable>);
+    body_buffer.set_highlight_syntax(true);
+    // Use Adwaita-dark or Adwaita style scheme if available
+    let style_mgr = sv::StyleSchemeManager::default();
+    if let Some(scheme) = style_mgr.scheme("Adwaita-dark").or_else(|| style_mgr.scheme("Adwaita")) {
+        body_buffer.set_style_scheme(Some(&scheme));
+    }
     body_buffer.set_text("Select a profile, then click Refresh to load messages.");
+    // No highlighting for the initial placeholder
+    body_buffer.set_language(None);
 
     let preview_labels = PreviewLabels {
         from_label,
@@ -651,7 +661,7 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
     scrolled.set_hexpand(true);
     scrolled.set_policy(PolicyType::Automatic, PolicyType::Automatic);
 
-    let body_view = TextView::with_buffer(&labels.body_buffer);
+    let body_view = sv::View::with_buffer(&labels.body_buffer);
     body_view.set_editable(false);
     body_view.set_cursor_visible(false);
     body_view.set_wrap_mode(WrapMode::WordChar);
@@ -659,6 +669,8 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
     body_view.set_right_margin(4);
     body_view.set_top_margin(4);
     body_view.set_bottom_margin(4);
+    body_view.set_show_line_numbers(true);
+    body_view.set_monospace(true);
 
     scrolled.set_child(Some(&body_view));
     vbox.append(&scrolled);
@@ -667,6 +679,92 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
 }
 
 /// Create a dim, right-aligned header key label (e.g. "From:").
+/// Detect the source language from message content.
+///
+/// Email bodies often have prose before the code/diff, so we scan
+/// the full content rather than just the first few lines.
+fn detect_language(content: &str) -> Option<sv::Language> {
+    let lm = sv::LanguageManager::default();
+
+    // — Diff: scan anywhere in the message —
+    // Patches in emails are preceded by prose, so we search
+    // the whole content for diff markers.
+    let is_diff = content.lines().any(|line| {
+        line.starts_with("diff --git")
+            || line.starts_with("diff -r")
+            || line.starts_with("--- a/")
+            || line.starts_with("+++ b/")
+            || line.starts_with("@@ ")
+    });
+    if is_diff {
+        return lm.language("diff");
+    }
+
+    // — Rust: look for strong Rust indicators (avoid false positives
+    //   from email prose like "use ..." or "struct ...") —
+    //   Require at least two distinct Rust markers.
+    let rust_markers = [
+        "fn ", "pub fn ", "pub(crate) fn ", "pub(super) fn ",
+        "impl ",
+        "let mut ",
+        "match ",
+        "-> ",              // return arrow
+        "::",
+    ];
+    let rust_hits: usize = content.lines()
+        .take(50)
+        .map(|line| {
+            let trimmed = line.trim();
+            // Skip obvious email lines (quotes, signatures)
+            if trimmed.starts_with('>') || trimmed.starts_with("-- ") || trimmed.is_empty() {
+                return 0;
+            }
+            let mut count = 0;
+            for marker in &rust_markers {
+                if trimmed.contains(marker) && !trimmed.starts_with("//") {
+                    count += 1;
+                    break;
+                }
+            }
+            count
+        })
+        .sum();
+    if rust_hits >= 2 {
+        return lm.language("rust");
+    }
+
+    // — C: similar logic —
+    let c_markers = ["#include", "void ", "typedef ", "#define ", "enum {"];
+    let c_hits: usize = content.lines()
+        .take(50)
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('>') || trimmed.starts_with("-- ") || trimmed.is_empty() {
+                return 0;
+            }
+            for marker in &c_markers {
+                if trimmed.starts_with(marker) || trimmed.contains(marker) {
+                    return 1;
+                }
+            }
+            0
+        })
+        .sum();
+    if c_hits >= 2 {
+        return lm.language("c");
+    }
+
+    // — Fallback: let GtkSourceView guess —
+    lm.guess_language(None::<&std::path::Path>, None)
+}
+
+/// Set the buffer's language based on content and display the text.
+fn set_body_with_highlight(buffer: &sv::Buffer, text: &str) {
+    let lang = detect_language(text);
+    buffer.set_language(lang.as_ref());
+    buffer.set_text(text);
+}
+
 fn make_header_key(text: &str) -> Label {
     let label = Label::new(Some(text));
     label.set_xalign(1.0);

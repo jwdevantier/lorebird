@@ -32,6 +32,7 @@
 
           buildInputs = with pkgs; [
             gtk4
+            gtksourceview5
             sqlite-interactive
           ];
 
@@ -47,6 +48,7 @@
             echo "=== loreread dev shell ==="
             echo "Rust:  $(rustc --version)"
             echo "GTK4:  ${pkgs.gtk4.version}"
+            echo "GtkSourceView: ${pkgs.gtksourceview5.version}"
             echo "SQLite: $(sqlite3 --version)"
             echo "Lua:   vendored (mlua)"
           '';
@@ -66,6 +68,7 @@
 
             buildInputs = with pkgs; [
               gtk4
+              gtksourceview5
             ];
 
             cargoLock = {
