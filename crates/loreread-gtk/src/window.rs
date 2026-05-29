@@ -241,6 +241,20 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             && let Some(node) = row.item().and_downcast::<ThreadNode>()
         {
             pl.from_label.set_text(&node.sender());
+            let to_full = node.to_addrs();
+            pl.to_label.set_text(&truncate_addr(&to_full));
+            if to_full.len() > 120 {
+                pl.to_label.set_tooltip_text(Some(&to_full));
+            } else {
+                pl.to_label.set_tooltip_text(None);
+            }
+            let cc_full = node.cc_addrs();
+            pl.cc_label.set_text(&truncate_addr(&cc_full));
+            if cc_full.len() > 120 {
+                pl.cc_label.set_tooltip_text(Some(&cc_full));
+            } else {
+                pl.cc_label.set_tooltip_text(None);
+            }
             pl.subject_label.set_text(&node.subject());
             pl.date_label.set_text(&node.last_reply());
 
@@ -253,6 +267,10 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             return;
         }
         pl.from_label.set_text("");
+        pl.to_label.set_text("");
+        pl.to_label.set_tooltip_text(None);
+        pl.cc_label.set_text("");
+        pl.cc_label.set_tooltip_text(None);
         pl.subject_label.set_text("");
         pl.date_label.set_text("");
         set_body_with_highlight(&pl.body_buffer, "");
@@ -442,6 +460,8 @@ fn make_sidebar_row(item: &FolderItem) -> ListBoxRow {
 /// Labels in the preview pane that need to be updated on selection change.
 pub(crate) struct PreviewLabels {
     pub from_label: Label,
+    pub to_label: Label,
+    pub cc_label: Label,
     pub subject_label: Label,
     pub date_label: Label,
     pub body_buffer: sv::Buffer,
@@ -474,6 +494,13 @@ fn build_center_pane(root_model: &ListStore, is_dark: bool) -> (Box, SingleSelec
     // ── Preview labels (updated on selection) ────────────────
     let from_label = Label::new(Some("no message selected"));
     from_label.set_xalign(0.0);
+    from_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    let to_label = Label::new(Some(""));
+    to_label.set_xalign(0.0);
+    to_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    let cc_label = Label::new(Some(""));
+    cc_label.set_xalign(0.0);
+    cc_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     let subject_label = Label::new(Some(""));
     subject_label.set_xalign(0.0);
     let date_label = Label::new(Some(""));
@@ -495,6 +522,8 @@ fn build_center_pane(root_model: &ListStore, is_dark: bool) -> (Box, SingleSelec
 
     let preview_labels = PreviewLabels {
         from_label,
+        to_label,
+        cc_label,
         subject_label,
         date_label,
         body_buffer,
@@ -732,11 +761,10 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
     };
 
     add_row(&headers, 0, "From", &labels.from_label);
-    let to_label = Label::new(Some(""));
-    to_label.set_xalign(0.0);
-    add_row(&headers, 1, "To", &to_label);
-    add_row(&headers, 2, "Subject", &labels.subject_label);
-    add_row(&headers, 3, "Date", &labels.date_label);
+    add_row(&headers, 1, "To", &labels.to_label);
+    add_row(&headers, 2, "Cc", &labels.cc_label);
+    add_row(&headers, 3, "Subject", &labels.subject_label);
+    add_row(&headers, 4, "Date", &labels.date_label);
 
     vbox.append(&headers);
 
@@ -859,5 +887,17 @@ fn make_header_key(text: &str) -> Label {
     label.set_xalign(1.0);
     label.add_css_class("dim-label");
     label
+}
+
+/// Truncate an address list to 120 characters, adding "…" if longer.
+fn truncate_addr(s: &str) -> String {
+    const MAX: usize = 120;
+    if s.len() <= MAX {
+        s.to_string()
+    } else {
+        // Find the last separator before the limit to avoid cutting mid-address
+        let cut = s[..MAX].rfind(',').map(|i| i + 1).unwrap_or(MAX);
+        format!("{}…", &s[..cut])
+    }
 }
 

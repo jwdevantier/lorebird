@@ -286,13 +286,15 @@ impl ThreadNodeTree {
     fn build_node(t: &Thread<DbMessage>, maildir: &std::path::Path) -> ThreadNode {
         let msg = t.message.as_ref();
 
-        let (from, body) = msg
+        let (from, to, cc, body) = msg
             .as_ref()
             .and_then(|m| {
                 loreread_core::store::read_raw_message(maildir, &m.filename)
                     .map(|parsed| {
                         (
                             parsed.from_addr.unwrap_or_else(|| m.from_addr.clone().unwrap_or_default()),
+                            parsed.to_addr.unwrap_or_default(),
+                            parsed.cc_addr.unwrap_or_default(),
                             parsed.body_text.unwrap_or_default(),
                         )
                     })
@@ -302,6 +304,8 @@ impl ThreadNodeTree {
                     msg.as_ref()
                         .and_then(|m| m.from_addr.clone())
                         .unwrap_or_default(),
+                    String::new(),
+                    String::new(),
                     String::new(),
                 )
             });
@@ -322,7 +326,7 @@ impl ThreadNodeTree {
         let last_reply_ts = Self::max_ts(t);
         let last_reply = format_relative_time(last_reply_ts);
 
-        let node = ThreadNode::new(&subject, &from, &started, &last_reply, started_ts, last_reply_ts);
+        let node = ThreadNode::new(&subject, &from, &to, &cc, &started, &last_reply, started_ts, last_reply_ts);
         node.set_body_preview(body);
 
         for child in &t.children {

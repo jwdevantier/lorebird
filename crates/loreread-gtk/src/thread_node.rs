@@ -27,6 +27,10 @@ mod imp {
         subject: RefCell<String>,
         #[property(get, set)]
         sender: RefCell<String>,
+        #[property(get, set)]
+        to_addrs: RefCell<String>,
+        #[property(get, set)]
+        cc_addrs: RefCell<String>,
         /// "Started" column: relative-time display string.
         #[property(get, set)]
         started: RefCell<String>,
@@ -67,6 +71,8 @@ impl ThreadNode {
     pub fn new(
         subject: &str,
         from_addr: &str,
+        to_addrs: &str,
+        cc_addrs: &str,
         started: &str,
         last_reply: &str,
         started_ts: i64,
@@ -75,6 +81,8 @@ impl ThreadNode {
         glib::Object::builder()
             .property("subject", subject)
             .property("sender", from_addr)
+            .property("to-addrs", to_addrs)
+            .property("cc-addrs", cc_addrs)
             .property("started", started)
             .property("last-reply", last_reply)
             .property("started-ts", started_ts)
