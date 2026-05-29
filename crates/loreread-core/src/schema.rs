@@ -22,7 +22,7 @@ pub fn init_db(conn: &Connection) -> SqlResult<()> {
             subject     TEXT,
             from_addr   TEXT,          -- from From: header, for display
             date        TEXT,          -- from Date: header, display only
-            received_ts INTEGER,       -- from Received: header, Unix epoch
+            received_ts INTEGER,       -- effective Unix epoch (Received, with Date fallback)
             filename    TEXT NOT NULL UNIQUE  -- path relative to maildir root (base name, no flags)
         );
 

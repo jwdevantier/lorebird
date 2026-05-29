@@ -106,6 +106,22 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
 
             let refs = msg.references.join(" ");
 
+            // ── Effective timestamp ─────────────────────────────────────
+            // Received-TS (from Received: header, set by MTA, UTC) is the
+            // primary timestamp.  However, mail_parser sometimes produces
+            // garbage (e.g. negative values).  When that happens, fall
+            // back to date_ts (from Date: header, user-provided).
+            let effective_ts = if msg.received_ts > 946_684_800 {
+                // After 2000-01-01 — sane, use it
+                msg.received_ts
+            } else if msg.date_ts > 946_684_800 {
+                // Received is garbage but Date header looks sane
+                msg.date_ts
+            } else {
+                // Both are broken — keep received_ts (better than 0)
+                msg.received_ts
+            };
+
             // ── mail_ndx (INSERT OR IGNORE — filename UNIQUE catches dupes) ──
             let ndx_changes = conn.execute(
                 "INSERT OR IGNORE INTO mail_ndx (message_id, refs, subject, from_addr, date, received_ts, filename)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -115,7 +131,7 @@ fn index_maildir_inner(conn: &Connection, maildir_path: &Path) -> SqlResult<usiz
                     msg.subject,
                     msg.from_addr,
                     msg.date_rfc3339,
-                    msg.received_ts,
+                    effective_ts,
                     rel_path,
                 ],
             )?;
