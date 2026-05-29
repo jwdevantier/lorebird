@@ -311,12 +311,18 @@ impl ThreadNodeTree {
             .and_then(|m| m.subject.clone())
             .unwrap_or_else(|| "(no subject)".to_string());
 
-        let date = msg
+        // started_ts = root message timestamp (or i64::MAX for ghost nodes)
+        let started_ts = msg
             .as_ref()
-            .map(|m| format_relative_time(m.received_ts))
-            .unwrap_or_default();
+            .map(|m| m.received_ts)
+            .unwrap_or(i64::MAX);
+        let started = format_relative_time(started_ts);
 
-        let node = ThreadNode::new(&subject, &from, &date);
+        // last_reply_ts = most recent timestamp in the whole subtree
+        let last_reply_ts = Self::max_ts(t);
+        let last_reply = format_relative_time(last_reply_ts);
+
+        let node = ThreadNode::new(&subject, &from, &started, &last_reply, started_ts, last_reply_ts);
         node.set_body_preview(body);
 
         for child in &t.children {
@@ -325,6 +331,14 @@ impl ThreadNodeTree {
         }
 
         node
+    }
+
+    /// Find the most recent timestamp in a thread subtree.
+    fn max_ts(t: &Thread<DbMessage>) -> i64 {
+        let own = t.message.as_ref().map(|m| m.received_ts).unwrap_or(0);
+        t.children
+            .iter()
+            .fold(own, |acc, child| acc.max(Self::max_ts(child)))
     }
 }
 

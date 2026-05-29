@@ -1,9 +1,17 @@
 //! GObject model for a thread node in the mail list.
 //!
 //! Each `ThreadNode` represents a single message visible in the
-//! `ColumnView` tree. Child messages (replies) are stored in a
+//! `ColumnView` tree.  Child messages (replies) are stored in a
 //! lazily-created `gio::ListStore` so that `TreeListModel` can
 //! discover them.
+//!
+//! Two timestamp properties track thread activity:
+//! - `started-ts`: unix timestamp of the thread's root message
+//! - `last-reply-ts`: unix timestamp of the most recent message
+//!   in the thread (including the root itself)
+//!
+//! The display strings (`started`, `last-reply`) are relative-time
+//! labels like "2h ago" derived from the timestamps at creation time.
 
 mod imp {
     use gio::ListStore;
@@ -19,8 +27,18 @@ mod imp {
         subject: RefCell<String>,
         #[property(get, set)]
         sender: RefCell<String>,
+        /// "Started" column: relative-time display string.
         #[property(get, set)]
-        date: RefCell<String>,
+        started: RefCell<String>,
+        /// "Last Reply" column: relative-time display string.
+        #[property(get, set)]
+        last_reply: RefCell<String>,
+        /// Unix timestamp of the root message — used for sorting.
+        #[property(get, set)]
+        started_ts: Cell<i64>,
+        /// Unix timestamp of the most recent message — used for sorting.
+        #[property(get, set)]
+        last_reply_ts: Cell<i64>,
         #[property(get, set)]
         has_children: Cell<bool>,
         #[property(get, set)]
@@ -45,12 +63,22 @@ glib::wrapper! {
 }
 
 impl ThreadNode {
-    /// Create a new thread node with the given display fields.
-    pub fn new(subject: &str, from_addr: &str, date: &str) -> Self {
+    /// Create a new thread node.
+    pub fn new(
+        subject: &str,
+        from_addr: &str,
+        started: &str,
+        last_reply: &str,
+        started_ts: i64,
+        last_reply_ts: i64,
+    ) -> Self {
         glib::Object::builder()
             .property("subject", subject)
             .property("sender", from_addr)
-            .property("date", date)
+            .property("started", started)
+            .property("last-reply", last_reply)
+            .property("started-ts", started_ts)
+            .property("last-reply-ts", last_reply_ts)
             .property("has-children", false)
             .property("body-preview", String::new())
             .build()

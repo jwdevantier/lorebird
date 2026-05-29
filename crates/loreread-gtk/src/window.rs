@@ -12,9 +12,9 @@ use gio::ListStore;
 use glib::Object;
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box, ColumnView, ColumnViewColumn, Grid, HeaderBar, IconSize,
-    Image, Label, ListBoxRow, ListItem, Orientation, Paned, PolicyType, SearchEntry,
-    ScrolledWindow, SignalListItemFactory, SingleSelection, Spinner,
+    Application, ApplicationWindow, Box, ColumnView, ColumnViewColumn, CustomSorter, Grid, HeaderBar, IconSize,
+    Image, Label, ListBoxRow, ListItem, Ordering, Orientation, Paned, PolicyType, SearchEntry,
+    ScrolledWindow, SignalListItemFactory, SingleSelection, SortListModel, Spinner, SortType,
     TreeExpander, TreeListModel, TreeListRow, WrapMode,
 };
 use sourceview5 as sv;
@@ -242,7 +242,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         {
             pl.from_label.set_text(&node.sender());
             pl.subject_label.set_text(&node.subject());
-            pl.date_label.set_text(&node.date());
+            pl.date_label.set_text(&node.last_reply());
 
             let body = node.body_preview();
             if body.is_empty() {
@@ -506,32 +506,16 @@ fn build_center_pane(root_model: &ListStore, is_dark: bool) -> (Box, SingleSelec
 // ── Thread list (ColumnView + TreeListModel) ──────────────────────
 
 fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
-    // ── TreeListModel ────────────────────────────────────────
-    let tree_model = TreeListModel::new(
-        root_model.clone(),
-        false, // passthrough=false → items are TreeListRow
-        false, // autoexpand — user must click to expand
-        |item: &Object| -> Option<gio::ListModel> {
-            let node = item.downcast_ref::<ThreadNode>()?;
-            let children = node.children_store();
-            if children.n_items() > 0 {
-                Some(children.clone().upcast())
-            } else {
-                None
-            }
-        },
-    );
-
-    // ── Selection ───────────────────────────────────────────
-    let selection = SingleSelection::new(Some(tree_model));
-    selection.set_can_unselect(true);
-    selection.set_autoselect(false);
-    // autoselect=false means clicking the expander arrow toggles
-    // expand/collapse without also selecting the row.
-    // Selection only changes on an intentional click on the row content.
-
-    // ── Column view ─────────────────────────────────────────
-    let column_view = ColumnView::new(Some(selection.clone()));
+    // ── Column view (created first to get its composite sorter) ──
+    //
+    // GTK ColumnView sorting works like this:
+    // 1. Each sortable column has a CustomSorter that compares items
+    // 2. ColumnView.get_sorter() returns a composite sorter reflecting
+    //    the column the user last clicked and direction
+    // 3. That composite sorter drives a SortListModel, which keeps
+    //    root-level items in sorted order
+    // 4. TreeListModel wraps SortListModel for expansion
+    let column_view = ColumnView::new(None::<SingleSelection>);
     column_view.set_vexpand(true);
     column_view.set_hexpand(true);
 
@@ -596,18 +580,18 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
     let from_col = ColumnViewColumn::new(Some("From"), Some(from_factory));
     column_view.append_column(&from_col);
 
-    // — Column: Date ──────────────────────────────────────────
-    let date_factory = SignalListItemFactory::new();
-    date_factory.connect_setup(|_, obj| {
+    // — Column: Started ──────────────────────────────────────
+    let started_factory = SignalListItemFactory::new();
+    started_factory.connect_setup(|_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
         let label = Label::new(None);
         label.set_xalign(1.0);
-        label.set_width_chars(8);
+        label.set_width_chars(6);
         label.add_css_class("dim-label");
         label.add_css_class("numeric");
         list_item.set_child(Some(&label));
     });
-    date_factory.connect_bind(|_, obj| {
+    started_factory.connect_bind(|_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
         let row = list_item
             .item()
@@ -616,19 +600,103 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
         if let Some(node) = row.item().and_downcast::<ThreadNode>()
             && let Some(label) = list_item.child().and_downcast::<Label>()
         {
-            label.set_label(&node.date());
+            label.set_label(&node.started());
         }
     });
 
-    let date_col = ColumnViewColumn::new(Some("Date"), Some(date_factory));
-    date_col.set_resizable(false);
-    column_view.append_column(&date_col);
+    // Sorters compare ThreadNode items — ColumnView unwraps
+    // TreeListRow automatically before passing to sorters.
+    let started_sorter = CustomSorter::new(|a, b| {
+        let a_node = a.downcast_ref::<ThreadNode>().unwrap();
+        let b_node = b.downcast_ref::<ThreadNode>().unwrap();
+        match a_node.started_ts().cmp(&b_node.started_ts()) {
+            std::cmp::Ordering::Less => Ordering::Smaller,
+            std::cmp::Ordering::Equal => Ordering::Equal,
+            std::cmp::Ordering::Greater => Ordering::Larger,
+        }
+    });
+
+    let started_col =
+        ColumnViewColumn::new(Some("Started"), Some(started_factory));
+    started_col.set_sorter(Some(&started_sorter));
+    started_col.set_resizable(false);
+    column_view.append_column(&started_col);
+
+    // — Column: Last Reply ─────────────────────────────────
+    let last_reply_factory = SignalListItemFactory::new();
+    last_reply_factory.connect_setup(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().unwrap();
+        let label = Label::new(None);
+        label.set_xalign(1.0);
+        label.set_width_chars(10);
+        label.add_css_class("dim-label");
+        label.add_css_class("numeric");
+        list_item.set_child(Some(&label));
+    });
+    last_reply_factory.connect_bind(|_, obj| {
+        let list_item = obj.downcast_ref::<ListItem>().unwrap();
+        let row = list_item
+            .item()
+            .and_downcast::<TreeListRow>()
+            .unwrap();
+        if let Some(node) = row.item().and_downcast::<ThreadNode>()
+            && let Some(label) = list_item.child().and_downcast::<Label>()
+        {
+            label.set_label(&node.last_reply());
+        }
+    });
+
+    let last_reply_sorter = CustomSorter::new(|a, b| {
+        let a_node = a.downcast_ref::<ThreadNode>().unwrap();
+        let b_node = b.downcast_ref::<ThreadNode>().unwrap();
+        // Natural ascending order; SortType::Descending reverses to newest-first
+        match a_node.last_reply_ts().cmp(&b_node.last_reply_ts()) {
+            std::cmp::Ordering::Less => Ordering::Smaller,
+            std::cmp::Ordering::Equal => Ordering::Equal,
+            std::cmp::Ordering::Greater => Ordering::Larger,
+        }
+    });
+
+    let last_reply_col =
+        ColumnViewColumn::new(Some("Last Reply"), Some(last_reply_factory));
+    last_reply_col.set_sorter(Some(&last_reply_sorter));
+    last_reply_col.set_resizable(false);
+    column_view.append_column(&last_reply_col);
+
+    // ── Model pipeline: SortListModel → TreeListModel → Selection ──
+    //
+    // ColumnView.get_sorter() returns a composite sorter that tracks
+    // which column the user clicked and in which direction.  We plug
+    // it into a SortListModel so the root-level items stay sorted.
+    let view_sorter = column_view.sorter().expect("ColumnView must have a sorter");
+    let sorted_model = SortListModel::new(Some(root_model.clone()), Some(view_sorter));
+
+    let tree_model = TreeListModel::new(
+        sorted_model.upcast::<gio::ListModel>(),
+        false, // passthrough=false → items are TreeListRow
+        false, // autoexpand — user must click to expand
+        |item: &Object| -> Option<gio::ListModel> {
+            let node = item.downcast_ref::<ThreadNode>()?;
+            let children = node.children_store();
+            if children.n_items() > 0 {
+                Some(children.clone().upcast())
+            } else {
+                None
+            }
+        },
+    );
+
+    let selection = SingleSelection::new(Some(tree_model));
+    selection.set_can_unselect(true);
+    selection.set_autoselect(false);
+
+    column_view.set_model(Some(&selection));
+
+    // Default sort: Last Reply descending (newest first)
+    column_view.sort_by_column(Some(&last_reply_col), SortType::Descending);
 
     (column_view, selection)
 }
-
-// ── Preview pane ──────────────────────────────────────────────────
-
 fn build_preview_pane(labels: &PreviewLabels) -> Box {
     let vbox = Box::new(Orientation::Vertical, 0);
     vbox.set_margin_top(8);
@@ -781,3 +849,4 @@ fn make_header_key(text: &str) -> Label {
     label.add_css_class("dim-label");
     label
 }
+
