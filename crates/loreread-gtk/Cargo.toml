@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 gtk4 = { version = "0.11", package = "gtk4", features = ["v4_10"] }
+gdk4 = "0.11"
 glib = { version = "0.22", features = ["v2_74"] }
 gio = "0.22"
 sourceview5 = "0.11"

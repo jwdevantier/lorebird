@@ -529,7 +529,7 @@ fn build_center_pane(root_model: &ListStore, is_dark: bool) -> (Box, SingleSelec
         body_buffer.set_style_scheme(Some(&scheme));
     }
     body_buffer.set_text("Select a profile, then click Refresh to load messages.");
-    // No highlighting for the initial placeholder
+    // Placeholder: no language, no highlighting
     body_buffer.set_language(None);
 
     let preview_labels = PreviewLabels {
@@ -812,84 +812,111 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
 ///
 /// Email bodies often have prose before the code/diff, so we scan
 /// the full content rather than just the first few lines.
-fn detect_language(content: &str) -> Option<sv::Language> {
-    let lm = sv::LanguageManager::default();
-
-    // — Diff: scan anywhere in the message —
-    // Patches in emails are preceded by prose, so we search
-    // the whole content for diff markers.
-    let is_diff = content.lines().any(|line| {
-        line.starts_with("diff --git")
-            || line.starts_with("diff -r")
-            || line.starts_with("--- a/")
-            || line.starts_with("+++ b/")
-            || line.starts_with("@@ ")
-    });
-    if is_diff {
-        return lm.language("diff");
-    }
-
-    // — Rust: look for strong Rust indicators (avoid false positives
-    //   from email prose like "use ..." or "struct ...") —
-    //   Require at least two distinct Rust markers.
-    let rust_markers = [
-        "fn ", "pub fn ", "pub(crate) fn ", "pub(super) fn ",
-        "impl ",
-        "let mut ",
-        "match ",
-        "-> ",              // return arrow
-        "::",
-    ];
-    let rust_hits: usize = content.lines()
-        .take(50)
-        .map(|line| {
-            let trimmed = line.trim();
-            // Skip obvious email lines (quotes, signatures)
-            if trimmed.starts_with('>') || trimmed.starts_with("-- ") || trimmed.is_empty() {
-                return 0;
-            }
-            let mut count = 0;
-            for marker in &rust_markers {
-                if trimmed.contains(marker) && !trimmed.starts_with("//") {
-                    count += 1;
-                    break;
-                }
-            }
-            count
-        })
-        .sum();
-    if rust_hits >= 2 {
-        return lm.language("rust");
-    }
-
-    // — C: similar logic —
-    let c_markers = ["#include", "void ", "typedef ", "#define ", "enum {"];
-    let c_hits: usize = content.lines()
-        .take(50)
-        .map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with('>') || trimmed.starts_with("-- ") || trimmed.is_empty() {
-                return 0;
-            }
-            for marker in &c_markers {
-                if trimmed.starts_with(marker) || trimmed.contains(marker) {
-                    return 1;
-                }
-            }
-            0
-        })
-        .sum();
-    if c_hits >= 2 {
-        return lm.language("c");
-    }
-
-    // — Fallback: let GtkSourceView guess —
-    lm.guess_language(None::<&std::path::Path>, None)
+/// Does this line look like the start of a diff section?
+/// Does this line look like the start of a unified diff header?
+/// Does this line mark the start of a diff region?
+///
+/// Recognises unified-diff headers and the standalone `---` separator
+/// that precedes the diff stats block in patch emails.
+fn is_diff_region_start(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    trimmed.starts_with("diff --git")
+        || trimmed.starts_with("diff -r")
+        || trimmed == "---"
 }
 
-/// Set the buffer's language based on content and display the text.
+/// Does this line mark the start of a mail signature?
+///
+/// The standard signature separator is `-- ` (two dashes + space),
+/// per RFC 3676.  We also match bare `--` as a fallback.
+fn is_signature_separator(line: &str) -> bool {
+    line == "-- " || line == "--"
+}
+
+/// Find character ranges of "prose" sections in a mail body.
+///
+/// The approach is region-based rather than line-by-line:
+///
+///   1. Scan for the first diff-starting line (`diff --git` or
+///      standalone `---`).  Everything before it is prose.
+///   2. Everything from that first diff start to the signature
+///      separator (`-- `) or message end is a **diff region** —
+///      the SourceView diff language handles syntax highlighting
+///      inside it automatically.  We don't need to classify
+///      individual lines as "is this diff content?".
+///   3. Anything after the signature separator is also prose.
+///
+/// Returns (start_char, end_char) pairs for prose sections,
+/// suitable for passing to `gtk_text_buffer_apply_tag()`
+/// via `iter_at_offset()`.
+fn find_prose_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return ranges;
+    }
+
+    // Track *character* offsets for each line start.
+    // `iter_at_offset` expects character positions, not bytes.
+    let mut line_char_starts: Vec<usize> = Vec::with_capacity(lines.len() + 1);
+    let mut pos = 0usize;
+    for line in &lines {
+        line_char_starts.push(pos);
+        pos += line.chars().count() + 1; // +1 for '\n'
+    }
+    line_char_starts.push(pos); // past-the-end sentinel
+
+    // Total characters in the buffer (including newlines)
+    let total_chars: usize = text.chars().count();
+
+    // Find first diff-region start
+    let first_diff = lines.iter().position(|l| is_diff_region_start(l));
+
+    // Find signature separator (if any)
+    let sig_pos = lines.iter().position(|l| is_signature_separator(l));
+
+    match first_diff {
+        None => {
+            // No diffs at all — entire message is prose (minus signature)
+            let end = sig_pos
+                .map(|i| line_char_starts[i])
+                .unwrap_or(total_chars);
+            if end > 0 {
+                ranges.push((0, end));
+            }
+        }
+        Some(fdi) => {
+            // Prose before first diff region
+            if fdi > 0 {
+                ranges.push((0, line_char_starts[fdi]));
+            }
+
+            // Trailing prose: anything after the signature separator.
+            // The diff region extends from fdi to the signature (or EOF).
+            // If there's a signature, the text after it is prose.
+            if let Some(si) = sig_pos {
+                // Signature line itself goes with the prose
+                let start = line_char_starts[si];
+                if start < total_chars {
+                    ranges.push((start, total_chars));
+                }
+            }
+        }
+    }
+
+    ranges
+}
+
+/// Render message body with diff highlighting and prose tagging.
+///
+/// Always sets the SourceView language to "diff" so that diff syntax
+/// (coloured `+`/`-` lines, `@@` headers, etc.) is highlighted.
+/// Prose sections (cover letters, commentary, signatures) get a
+/// TextTag with a subtle background tint so they stand out from the
+/// diff regions.
 fn set_body_with_highlight(buffer: &sv::Buffer, text: &str) {
-    let lang = detect_language(text);
+    let lm = sv::LanguageManager::default();
+    let lang = lm.language("diff");
     buffer.set_language(lang.as_ref());
     buffer.set_text(text);
 }
@@ -901,7 +928,6 @@ fn make_header_key(text: &str) -> Label {
     label
 }
 
-/// Truncate an address list to 120 characters, adding "…" if longer.
 fn truncate_addr(s: &str) -> String {
     const MAX: usize = 120;
     if s.len() <= MAX {
@@ -913,3 +939,53 @@ fn truncate_addr(s: &str) -> String {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prose_before_diff() {
+        let text = "Hello, this is a cover letter.\nSome more prose.\n\ndiff --git a/foo b/foo\n--- a/foo\n+++ b/foo\n@@ -1,3 +1,4 @@\n context\n-removed\n+added\n";
+        let ranges = find_prose_ranges(text);
+        assert!(!ranges.is_empty());
+        // First range should be the cover letter before the diff
+        let (s, e) = ranges[0];
+        let prose = &text[s..e.min(text.len())];
+        assert!(prose.contains("cover letter"));
+        assert!(!prose.contains("diff --git"));
+    }
+
+    #[test]
+    fn no_diff_all_prose() {
+        let text = "Just a plain email.\nNo patches here.\n";
+        let ranges = find_prose_ranges(text);
+        assert_eq!(ranges.len(), 1);
+        // Entire message is prose
+        assert_eq!(ranges[0].0, 0);
+    }
+
+    #[test]
+    fn standalone_dashes_start_diff() {
+        let text = "Cover letter text.\n\n---\n include/foo.h | 19 +++\n 1 file changed\n\ndiff --git a/foo b/foo\nnew file mode 100644\n--- /dev/null\n+++ b/foo\n@@ -0,0 +1,19 @@\n+content\n";
+        let ranges = find_prose_ranges(text);
+        // Should have prose before the --- line
+        assert!(!ranges.is_empty());
+        let (s, e) = ranges[0];
+        let prose = &text[s..e.min(text.len())];
+        assert!(prose.contains("Cover letter"));
+    }
+
+    #[test]
+    fn signature_after_diff() {
+        let text = "diff --git a/bar b/bar\n--- a/bar\n+++ b/bar\n@@ -1 +1 @@\n-old\n+new\n-- \nJohn Smith\n";
+        let ranges = find_prose_ranges(text);
+        // Signature after diff should be prose
+        assert!(!ranges.is_empty());
+        // Signature part should start with "-- "
+        assert!(ranges.iter().any(|(s, e)| {
+            let end = (*e).min(text.len());
+            text[*s..end].starts_with("--")
+        }));
+    }
+}
