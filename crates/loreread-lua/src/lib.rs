@@ -317,6 +317,12 @@ fn build_mail_table(lua: &Lua, mail: &ComposeMail) -> LuaResult<Table> {
     table.set("bcc", mail.bcc.as_str())?;
     table.set("subject", mail.subject.as_str())?;
 
+    if let Some(ref v) = mail.date {
+        table.set("date", v.as_str())?;
+    }
+    if let Some(ref v) = mail.message_id {
+        table.set("message_id", v.as_str())?;
+    }
     if let Some(ref v) = mail.in_reply_to {
         table.set("in_reply_to", v.as_str())?;
     }
@@ -345,6 +351,8 @@ fn extract_compose_mail_from_table(table: &Table) -> LuaResult<ComposeMail> {
     let cc: String = table.get("cc").unwrap_or_default();
     let bcc: String = table.get("bcc").unwrap_or_default();
     let subject: String = table.get("subject")?;
+    let date: Option<String> = table.get("date")?;
+    let message_id: Option<String> = table.get("message_id")?;
     let in_reply_to: Option<String> = table.get("in_reply_to")?;
     let references: Option<String> = table.get("references")?;
     let body_text: String = table.get("body_text")?;
@@ -367,6 +375,8 @@ fn extract_compose_mail_from_table(table: &Table) -> LuaResult<ComposeMail> {
         cc,
         bcc,
         subject,
+        date,
+        message_id,
         in_reply_to,
         references,
         body_text,
@@ -625,6 +635,12 @@ return mail_to_rfc2822(mail)
         assert!(result.contains("In-Reply-To: <parent@example.com>"));
         assert!(result.contains("X-Mailer: loreread"));
         assert!(result.contains("Hello"));
+        // Auto-generated headers
+        assert!(result.contains("Date: "));
+        assert!(result.contains("Message-ID: <"));
+        assert!(result.contains("MIME-Version: 1.0"));
+        assert!(result.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(result.contains("X-Mailer: loreread"));
         // Body must be separated from headers by a blank line
         assert!(result.contains("\nHello\n"));
     }
@@ -740,6 +756,8 @@ config = {{
             cc: String::new(),
             bcc: String::new(),
             subject: "Test send".to_string(),
+            date: None,
+            message_id: None,
             in_reply_to: None,
             references: None,
             body_text: "Hello from send test\n".to_string(),

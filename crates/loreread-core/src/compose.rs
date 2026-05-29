@@ -22,12 +22,19 @@ pub struct ComposeMail {
     #[serde(default)]
     pub bcc: String,
     pub subject: String,
+    /// RFC 2822 Date header.  `None` means "generate at send time".
+    #[serde(default)]
+    pub date: Option<String>,
+    /// Message-ID (e.g. `<unique@host>`).  Set by `new_reply()` so
+    /// the hook can reference it; `None` means generate at serialise time.
+    #[serde(default)]
+    pub message_id: Option<String>,
     #[serde(default)]
     pub in_reply_to: Option<String>,
     #[serde(default)]
     pub references: Option<String>,
     pub body_text: String,
-    /// Arbitrary extra headers (e.g. X-Mailer, Reply-To).
+    /// Arbitrary extra headers (e.g. Reply-To).
     #[serde(default)]
     pub headers: HashMap<String, String>,
 }
@@ -55,16 +62,6 @@ pub struct ParentMail {
 impl ComposeMail {
     /// Build a pre-filled reply from a parent message and profile.
     ///
-    /// Follows standard reply conventions:
-    /// - `to` = parent's `from`
-    /// - `cc` = parent's `cc`
-    /// - `subject` = "Re: " prefix (no double Re:)
-    /// - `in_reply_to` = parent's `message_id`
-    /// - `references` = parent's references + " " + parent's message_id
-    /// - `from` = "Profile Name <profile@email>"
-    /// - `body_text` = quoted parent body with attribution line
-    /// Build a pre-filled reply from a parent message and profile.
-    ///
     /// Reply-All (mailing-list style):
     /// - `to`  = parent's `to` addresses + self (added if not already present)
     /// - `cc`  = parent's `cc` addresses minus self
@@ -72,6 +69,8 @@ impl ComposeMail {
     /// - `in_reply_to` = parent's `message_id`
     /// - `references` = parent's references + " " + parent's `message_id`
     /// - `from` = "Profile Name <profile@email>"
+    /// - `date` = `None` (auto-generated at send time)
+    /// - `message_id` = freshly generated unique ID
     /// - `body_text` = quoted parent body with attribution line
     pub fn new_reply(parent: &ParentMail, profile_name: &str, profile_email: &str) -> Self {
         let from = format!("{} <{}>", profile_name, profile_email);
@@ -109,6 +108,8 @@ impl ComposeMail {
             cc,
             bcc: String::new(),
             subject,
+            date: None, // generated at send time by to_rfc2822()
+            message_id: Some(generate_message_id(profile_email)),
             in_reply_to,
             references,
             body_text,
@@ -120,11 +121,14 @@ impl ComposeMail {
     ///
     /// Produces a string suitable for piping to sendmail `-t` or
     /// saving as a draft.  Headers are written in a deterministic
-    /// order followed by arbitrary user headers (sorted), then a
-    /// blank line, then the body.
+    /// order.  Missing `Date` and `Message-ID` are auto-generated.
+    /// `MIME-Version`, `Content-Type`, and `X-Mailer` are emitted
+    /// unless the user already set them in `self.headers`.
     pub fn to_rfc2822(&self) -> String {
         let mut out = String::new();
 
+        // ── Mandatory / conventional headers in standard order ──
+        out.push_str(&format!("Date: {}\n", self.date_header()));
         out.push_str(&format!("From: {}\n", self.from));
         out.push_str(&format!("To: {}\n", self.to));
         if !self.cc.is_empty() {
@@ -134,6 +138,7 @@ impl ComposeMail {
             out.push_str(&format!("Bcc: {}\n", self.bcc));
         }
         out.push_str(&format!("Subject: {}\n", self.subject));
+        out.push_str(&format!("Message-ID: {}\n", self.message_id_header()));
         if let Some(ref irt) = self.in_reply_to {
             out.push_str(&format!("In-Reply-To: {}\n", irt));
         }
@@ -141,23 +146,107 @@ impl ComposeMail {
             out.push_str(&format!("References: {}\n", refs));
         }
 
-        // Arbitrary headers in sorted order for determinism.
+        // ── MIME / X-Mailer (emit if user hasn't overridden) ──
+        let user_keys: std::collections::HashSet<&str> =
+            self.headers.keys().map(|s| s.as_str()).collect();
+
+        if !user_keys.contains("MIME-Version") {
+            out.push_str("MIME-Version: 1.0\n");
+        }
+        if !user_keys.contains("Content-Type") {
+            out.push_str("Content-Type: text/plain; charset=utf-8\n");
+        }
+        if !user_keys.contains("X-Mailer") {
+            out.push_str("X-Mailer: loreread\n");
+        }
+
+        // ── Arbitrary user headers in sorted order ──
         let mut headers: Vec<_> = self.headers.iter().collect();
         headers.sort_by_key(|(k, _)| *k);
         for (key, value) in headers {
             out.push_str(&format!("{}: {}\n", key, value));
         }
 
-        // Blank line separating headers from body
+        // ── Blank line + body ──
         out.push('\n');
         out.push_str(&self.body_text);
         out.push('\n');
 
         out
     }
+
+    /// Return the Date header value, generating it from the current
+    /// time if `self.date` is `None`.
+    fn date_header(&self) -> String {
+        match &self.date {
+            Some(d) => d.clone(),
+            None => {
+                let now = chrono::Local::now();
+                now.to_rfc2822()
+            }
+        }
+    }
+
+    /// Return the Message-ID header value, generating one if
+    /// `self.message_id` is `None`.  Uses the sender's email from
+    /// `self.from` to derive the Message-ID domain.
+    fn message_id_header(&self) -> String {
+        match &self.message_id {
+            Some(id) => id.clone(),
+            None => {
+                let email = extract_email_from_from(&self.from);
+                generate_message_id(&email)
+            }
+        }
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
+
+/// Generate a unique Message-ID in the style of `git send-email`:
+///
+/// `<YYYYMMDDHHMMSS.COUNTER-USERNAME@DOMAIN>`
+///
+/// - Timestamp in `%Y%m%d%H%M%S` for human-readability and sortability.
+/// - Per-process counter for uniqueness within a session.
+/// - Sender's email split: local-part → `USERNAME`, domain → Message-ID domain.
+///   Falls back to `unknown@localhost` if no email is provided.
+fn generate_message_id(sender_email: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let now = chrono::Local::now();
+    let ts = now.format("%Y%m%d%H%M%S");
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let (user, domain) = split_email(sender_email);
+    format!("<{}.{seq}-{user}@{domain}>", ts)
+}
+
+/// Split an email address into `(local_part, domain)`.
+///
+/// `"alice@example.com"` → `("alice", "example.com")`.
+/// Falls back to `("unknown", "localhost")` if the address has no `@`.
+fn split_email(email: &str) -> (String, String) {
+    match email.rfind('@') {
+        Some(i) => (email[..i].to_string(), email[i + 1..].to_string()),
+        None => ("unknown".to_string(), "localhost".to_string()),
+    }
+}
+
+/// Extract the bare email address from a `From` header value.
+///
+/// Handles both `"Name <email>"` and bare `"email"` forms.
+fn extract_email_from_from(from: &str) -> String {
+    // Try to extract from angle brackets
+    if let Some(start) = from.rfind('<') {
+        if let Some(end) = from[start..].find('>') {
+            return from[start + 1..start + end].to_string();
+        }
+    }
+    // Fall back: treat the whole string as a bare address
+    from.trim().to_string()
+}
 
 /// Format the reply body with attribution and quoted text.
 ///
@@ -257,6 +346,11 @@ mod tests {
         assert_eq!(mail.cc, "bob@example.com, carol@example.com");
         assert_eq!(mail.bcc, "");
         assert_eq!(mail.subject, "Re: [PATCH v2] Fix memory leak");
+        assert!(mail.date.is_none()); // generated at send time
+        assert!(mail.message_id.is_some()); // freshly generated
+        assert!(mail.message_id.as_ref().unwrap().starts_with("<"));
+        // Message-ID uses sender domain: riccardo@defmacro.it → @defmacro.it
+        assert!(mail.message_id.as_ref().unwrap().ends_with("@defmacro.it>"));
         assert_eq!(mail.in_reply_to, Some("<abc@def>".to_string()));
         assert_eq!(
             mail.references,
@@ -295,7 +389,7 @@ mod tests {
             ..make_parent()
         };
         let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
-        // The whole “Riccardo Maffulli <riccardo@defmacro.it>” entry is removed
+        // The whole "Riccardo Maffulli <riccardo@defmacro.it>" entry is removed
         assert_eq!(mail.cc, "bob@example.com");
     }
 
@@ -375,22 +469,31 @@ mod tests {
             cc: "list@example.com".to_string(),
             bcc: String::new(),
             subject: "Re: Test".to_string(),
+            date: Some("Thu, 29 May 2025 10:00:00 +0000".to_string()),
+            message_id: Some("<test@localhost>".to_string()),
             in_reply_to: Some("<parent@example.com>".to_string()),
             references: Some("<grandparent@example.com> <parent@example.com>".to_string()),
             body_text: "Hello\n".to_string(),
             headers: HashMap::new(),
         };
-        mail.headers.insert("X-Mailer".to_string(), "loreread".to_string());
+        mail.headers.insert("X-Custom".to_string(), "value".to_string());
 
         let rfc = mail.to_rfc2822();
-        assert!(rfc.starts_with("From: Bob <bob@example.com>\n"));
+        assert!(rfc.contains("Date: Thu, 29 May 2025 10:00:00 +0000\n"));
+        assert!(rfc.contains("From: Bob <bob@example.com>\n"));
         assert!(rfc.contains("To: Alice <alice@example.com>\n"));
         assert!(rfc.contains("Cc: list@example.com\n"));
         assert!(!rfc.contains("Bcc:")); // empty Bcc omitted
         assert!(rfc.contains("Subject: Re: Test\n"));
+        assert!(rfc.contains("Message-ID: <test@localhost>\n"));
         assert!(rfc.contains("In-Reply-To: <parent@example.com>\n"));
         assert!(rfc.contains("References: <grandparent@example.com> <parent@example.com>\n"));
+        // Auto-generated MIME / X-Mailer headers
+        assert!(rfc.contains("MIME-Version: 1.0\n"));
+        assert!(rfc.contains("Content-Type: text/plain; charset=utf-8\n"));
         assert!(rfc.contains("X-Mailer: loreread\n"));
+        // User custom header
+        assert!(rfc.contains("X-Custom: value\n"));
         // Blank line + body
         assert!(rfc.contains("\nHello\n"));
     }
@@ -403,14 +506,76 @@ mod tests {
             cc: String::new(),
             bcc: String::new(),
             subject: "Hello".to_string(),
+            date: None,       // auto-generated
+            message_id: None, // auto-generated
             in_reply_to: None,
             references: None,
             body_text: "Body\n".to_string(),
             headers: HashMap::new(),
         };
         let rfc = mail.to_rfc2822();
+        assert!(rfc.contains("Date: ")); // auto-generated
+        assert!(rfc.contains("Message-ID: <")); // auto-generated
+        // Auto-generated uses sender domain from From: header
+        assert!(rfc.contains("@b>")); // from "A <a@b>"
+        assert!(rfc.contains("MIME-Version: 1.0"));
+        assert!(rfc.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(rfc.contains("X-Mailer: loreread"));
         assert!(!rfc.contains("In-Reply-To:"));
         assert!(!rfc.contains("References:"));
         assert!(!rfc.contains("Cc:"));
+    }
+
+    #[test]
+    fn to_rfc2822_user_overrides_mime_headers() {
+        let mut mail = ComposeMail {
+            from: "A <a@b>".to_string(),
+            to: "C <c@d>".to_string(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Hello".to_string(),
+            date: Some("Thu, 01 Jan 2025 00:00:00 +0000".to_string()),
+            message_id: Some("<override@me>".to_string()),
+            in_reply_to: None,
+            references: None,
+            body_text: "Body\n".to_string(),
+            headers: HashMap::new(),
+        };
+        // User sets Content-Type and X-Mailer in headers map
+        mail.headers.insert("Content-Type".to_string(), "text/html; charset=utf-8".to_string());
+        mail.headers.insert("X-Mailer".to_string(), "my-client/1.0".to_string());
+
+        let rfc = mail.to_rfc2822();
+        // Default Content-Type should NOT appear (user overrides)
+        assert!(!rfc.contains("text/plain; charset=utf-8"));
+        // User's values appear in the arbitrary-headers section
+        assert!(rfc.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(rfc.contains("X-Mailer: my-client/1.0"));
+    }
+
+    #[test]
+    fn generate_message_id_format() {
+        let mid = generate_message_id("alice@example.com");
+        assert!(mid.starts_with("<"));
+        assert!(mid.ends_with("@example.com>"));
+        // Local-part: YYYYMMDDHHMMSS.COUNTER-alice
+        let inner = &mid[1..mid.len() - 1];
+        let parts: Vec<&str> = inner.split('@').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].contains("-alice")); // username from email
+        assert_eq!(parts[1], "example.com"); // domain from email
+        // Timestamp is 14 digits at the start
+        let dot_pos = parts[0].find('.').unwrap();
+        let ts = &parts[0][..dot_pos];
+        assert_eq!(ts.len(), 14);
+        assert!(ts.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn generate_message_id_no_at() {
+        // Fallback when email has no @
+        let mid = generate_message_id("no-at-sign");
+        assert!(mid.ends_with("@localhost>"));
+        assert!(mid.contains("unknown"));
     }
 }

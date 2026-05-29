@@ -165,6 +165,8 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
             cc,
             bcc,
             subject,
+            date: mail.date.clone(),
+            message_id: mail.message_id.clone(),
             in_reply_to: mail.in_reply_to.clone(),
             references: mail.references.clone(),
             body_text,
