@@ -63,10 +63,20 @@ impl ComposeMail {
     /// - `references` = parent's references + " " + parent's message_id
     /// - `from` = "Profile Name <profile@email>"
     /// - `body_text` = quoted parent body with attribution line
+    /// Build a pre-filled reply from a parent message and profile.
+    ///
+    /// Reply-All (mailing-list style):
+    /// - `to`  = parent's `to` addresses + self (added if not already present)
+    /// - `cc`  = parent's `cc` addresses minus self
+    /// - `subject` = "Re: " prefix (no double Re:)
+    /// - `in_reply_to` = parent's `message_id`
+    /// - `references` = parent's references + " " + parent's `message_id`
+    /// - `from` = "Profile Name <profile@email>"
+    /// - `body_text` = quoted parent body with attribution line
     pub fn new_reply(parent: &ParentMail, profile_name: &str, profile_email: &str) -> Self {
         let from = format!("{} <{}>", profile_name, profile_email);
-        let to = parent.from.clone();
-        let cc = parent.cc.clone();
+        let to = add_self_to_addrs(&parent.to, profile_name, profile_email);
+        let cc = remove_self_from_addrs(&parent.cc, profile_email);
 
         // Subject: prepend "Re: " unless it already starts with it (case-insensitive).
         let subject = if parent.subject.to_lowercase().starts_with("re:") {
@@ -173,6 +183,48 @@ fn format_reply_body(body: &str, date: &str, from: &str) -> String {
     out
 }
 
+/// Add our own address to a comma-separated RFC 2822 address list
+/// if not already present.
+///
+/// Addresses are `"Name <email>"` or bare `email`, separated
+/// by `", "`.  We detect ourselves by email substring matching.
+fn add_self_to_addrs(addrs: &str, name: &str, email: &str) -> String {
+    if addr_list_contains(addrs, email) {
+        addrs.to_string()
+    } else if addrs.is_empty() {
+        format!("{} <{}>", name, email)
+    } else {
+        format!("{}, {} <{}>", addrs, name, email)
+    }
+}
+
+/// Remove our own address from a comma-separated RFC 2822 address list.
+///
+/// Splits on `", "`, removes any entry containing our email (matching
+/// both `alice@example.com` and `Alice <alice@example.com>`), and
+/// re-joins with `", "`.
+fn remove_self_from_addrs(addrs: &str, email: &str) -> String {
+    if addrs.is_empty() || !addr_list_contains(addrs, email) {
+        return addrs.to_string();
+    }
+    let filtered: Vec<&str> = addrs
+        .split(", ")
+        .filter(|entry| !entry.contains(email))
+        .collect();
+    filtered.join(", ")
+}
+
+/// Check whether a comma-separated RFC 2822 address list contains the
+/// given bare email.
+///
+/// Matches both `alice@example.com` and `Alice <alice@example.com>`
+/// by testing substring containment on each comma-separated entry.
+fn addr_list_contains(addrs: &str, email: &str) -> bool {
+    addrs
+        .split(", ")
+        .any(|entry| entry.contains(email))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -184,7 +236,7 @@ mod tests {
             message_id: Some("<abc@def>".to_string()),
             from: "Alice <alice@example.com>".to_string(),
             to: "list@example.com".to_string(),
-            cc: "bob@example.com carol@example.com".to_string(),
+            cc: "bob@example.com, carol@example.com".to_string(),
             subject: "[PATCH v2] Fix memory leak".to_string(),
             date: "2024-01-15T10:30:00+00:00".to_string(),
             references: "<parent@def> <other@def>".to_string(),
@@ -199,8 +251,10 @@ mod tests {
         let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
 
         assert_eq!(mail.from, "Riccardo <riccardo@defmacro.it>");
-        assert_eq!(mail.to, "Alice <alice@example.com>");
-        assert_eq!(mail.cc, "bob@example.com carol@example.com");
+        // To = parent.to + self (self not in parent.to)
+        assert_eq!(mail.to, "list@example.com, Riccardo <riccardo@defmacro.it>");
+        // Cc copied from parent, self not in parent.cc so unchanged
+        assert_eq!(mail.cc, "bob@example.com, carol@example.com");
         assert_eq!(mail.bcc, "");
         assert_eq!(mail.subject, "Re: [PATCH v2] Fix memory leak");
         assert_eq!(mail.in_reply_to, Some("<abc@def>".to_string()));
@@ -210,6 +264,59 @@ mod tests {
         );
         assert!(mail.body_text.contains("On 2024-01-15T10:30:00+00:00, Alice <alice@example.com> wrote:"));
         assert!(mail.body_text.contains("> This patch fixes..."));
+    }
+
+    #[test]
+    fn new_reply_self_already_in_to() {
+        let parent = ParentMail {
+            to: "list@example.com, riccardo@defmacro.it".to_string(),
+            ..make_parent()
+        };
+        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        // Self already present — To unchanged
+        assert_eq!(mail.to, "list@example.com, riccardo@defmacro.it");
+    }
+
+    #[test]
+    fn new_reply_removes_self_from_cc() {
+        let parent = ParentMail {
+            cc: "riccardo@defmacro.it, bob@example.com".to_string(),
+            ..make_parent()
+        };
+        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        // Cc has self removed
+        assert_eq!(mail.cc, "bob@example.com");
+    }
+
+    #[test]
+    fn new_reply_removes_self_from_cc_angle_form() {
+        let parent = ParentMail {
+            cc: "Riccardo Maffulli <riccardo@defmacro.it>, bob@example.com".to_string(),
+            ..make_parent()
+        };
+        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        // The whole “Riccardo Maffulli <riccardo@defmacro.it>” entry is removed
+        assert_eq!(mail.cc, "bob@example.com");
+    }
+
+    #[test]
+    fn new_reply_empty_to_adds_self() {
+        let parent = ParentMail {
+            to: String::new(),
+            ..make_parent()
+        };
+        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        assert_eq!(mail.to, "Riccardo <riccardo@defmacro.it>");
+    }
+
+    #[test]
+    fn new_reply_empty_cc_stays_empty() {
+        let parent = ParentMail {
+            cc: String::new(),
+            ..make_parent()
+        };
+        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        assert_eq!(mail.cc, "");
     }
 
     #[test]

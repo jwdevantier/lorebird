@@ -668,7 +668,7 @@ config = {
         assert!(result.is_some());
         let modified = result.unwrap();
         assert_eq!(modified.cc, "added-by-hook@example.com");
-        assert_eq!(modified.to, "Alice <alice@example.com>"); // unchanged by hook
+        assert_eq!(modified.to, "list@example.com, Riccardo <riccardo@defmacro.it>"); // unchanged by hook
     }
 
     #[test]

@@ -80,25 +80,51 @@ impl MailMessage {
 }
 
 /// Extract the first email address from a mail_parser `Address` enum.
+///
+/// Returns the address in display form: `"Name <email>"` when a
+/// display name is available, or just `"email"` otherwise.
 fn first_addr(addr: Option<&mail_parser::Address>) -> Option<String> {
     use mail_parser::Address;
     addr.and_then(|a| match a {
-        Address::List(addrs) => addrs.first().and_then(|a| a.address.clone().map(|s| s.to_string())),
-        Address::Group(groups) => groups.first().and_then(|g| g.addresses.first().and_then(|a| a.address.clone().map(|s| s.to_string()))),
+        Address::List(addrs) => addrs.first().map(|a| format_addr(a)),
+        Address::Group(groups) => groups.first().and_then(|g| g.addresses.first().map(|a| format_addr(a))),
     })
 }
 
 /// Collect all email addresses from a mail_parser `Address` enum into a
-/// single space-separated string (for FTS5 tokenization).
+/// comma-separated RFC 2822 formatted string.
+///
+/// Each address is rendered as `"Name <email>"` (when a display
+/// name exists) or just `"email"` (bare).  Addresses are separated by
+/// `", "` per RFC 2822.
+///
+/// This also works for FTS5 tokenisation: commas and angle brackets
+/// are word boundaries, so both display names and bare emails are
+/// searchable.
 fn all_addrs(addr: Option<&mail_parser::Address>) -> Option<String> {
     use mail_parser::Address;
     let addrs: Vec<String> = addr
         .map(|a| match a {
-            Address::List(list) => list.iter().filter_map(|a| a.address.clone()).map(|s| s.to_string()).collect(),
-            Address::Group(groups) => groups.iter().flat_map(|g| g.addresses.iter().filter_map(|a| a.address.clone().map(|s| s.to_string()))).collect(),
+            Address::List(list) => list.iter().map(|a| format_addr(a)).collect(),
+            Address::Group(groups) => groups
+                .iter()
+                .flat_map(|g| g.addresses.iter().map(|a| format_addr(a)))
+                .collect(),
         })
         .unwrap_or_default();
-    if addrs.is_empty() { None } else { Some(addrs.join(" ")) }
+    if addrs.is_empty() { None } else { Some(addrs.join(", ")) }
+}
+
+/// Format a single `mail_parser::Addr` as `"Name <email>"` or `"email"`.
+fn format_addr(a: &mail_parser::Addr) -> String {
+    match (&a.name, &a.address) {
+        (Some(name), Some(addr)) if !name.is_empty() => {
+            format!("{} <{}>", name, addr)
+        }
+        (_, Some(addr)) => addr.to_string(),
+        (Some(name), None) if !name.is_empty() => name.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// Extension trait to extract message IDs from a `HeaderValue`.
@@ -170,5 +196,26 @@ mod tests {
         let msgs = vec![msg];
         let threads = crate::thread::thread_messages(msgs);
         assert_eq!(threads.len(), 1);
+    }
+
+    #[test]
+    fn parse_to_with_display_names() {
+        let raw = b"To: Alice <alice@example.com>, Bob <bob@example.com>\r\nMessage-ID: <x@y>\r\n\r\nhi";
+        let msg = MailMessage::from_bytes(raw).unwrap();
+        assert_eq!(msg.to_addr.as_deref(), Some("Alice <alice@example.com>, Bob <bob@example.com>"));
+    }
+
+    #[test]
+    fn parse_to_bare_addresses() {
+        let raw = b"To: a@b.com, c@d.com\r\nMessage-ID: <x@y>\r\n\r\nhi";
+        let msg = MailMessage::from_bytes(raw).unwrap();
+        assert_eq!(msg.to_addr.as_deref(), Some("a@b.com, c@d.com"));
+    }
+
+    #[test]
+    fn parse_from_with_display_name() {
+        let raw = b"From: Alice <alice@example.com>\r\nMessage-ID: <x@y>\r\n\r\nhi";
+        let msg = MailMessage::from_bytes(raw).unwrap();
+        assert_eq!(msg.from_addr.as_deref(), Some("Alice <alice@example.com>"));
     }
 }
