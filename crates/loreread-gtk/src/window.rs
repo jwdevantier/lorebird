@@ -695,6 +695,17 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
     // Default sort: Last Reply descending (newest first)
     column_view.sort_by_column(Some(&last_reply_col), SortType::Descending);
 
+    // Double-click a row to expand/collapse its children
+    column_view.connect_activate(move |cv, pos| {
+        if let Some(item) = cv.model().and_then(|m| m.item(pos)) {
+            if let Some(row) = item.downcast_ref::<TreeListRow>() {
+                if row.is_expandable() {
+                    row.set_expanded(!row.is_expanded());
+                }
+            }
+        }
+    });
+
     (column_view, selection)
 }
 fn build_preview_pane(labels: &PreviewLabels) -> Box {
