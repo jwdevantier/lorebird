@@ -35,6 +35,7 @@ pub enum LuaResult {
     /// Config loaded successfully; here are the resolved profiles.
     InitDone {
         profiles: HashMap<String, ResolvedProfile>,
+        theme: String,
     },
 
     /// Config loading failed.
@@ -57,6 +58,12 @@ struct LuaState {
     vm: Vm,
     config: LoadedConfig,
     profiles: HashMap<String, ResolvedProfile>,
+}
+
+/// Initialisation result from the Lua thread.
+pub struct InitResult {
+    pub profiles: HashMap<String, ResolvedProfile>,
+    pub theme: String,
 }
 
 // ── Lua thread handle ──────────────────────────────────────────────
@@ -85,9 +92,9 @@ impl LuaThread {
     }
 
     /// Block until the Lua thread has loaded config.
-    pub fn recv_init(&self) -> Result<HashMap<String, ResolvedProfile>, String> {
+    pub fn recv_init(&self) -> Result<InitResult, String> {
         match self.result_rx.recv() {
-            Ok(LuaResult::InitDone { profiles }) => Ok(profiles),
+            Ok(LuaResult::InitDone { profiles, theme }) => Ok(InitResult { profiles, theme }),
             Ok(LuaResult::InitFailed { error }) => Err(error),
             Ok(_) => Err("unexpected result from Lua thread".to_string()),
             Err(_) => Err("Lua thread disconnected during init".to_string()),
@@ -123,7 +130,8 @@ fn lua_thread_main(
         Ok(state) => {
             eprintln!("[loreread-lua] loaded {} profile(s)", state.profiles.len());
             let profiles = state.profiles.clone();
-            let _ = result_tx.send(LuaResult::InitDone { profiles });
+            let theme = state.config.config.theme.clone();
+            let _ = result_tx.send(LuaResult::InitDone { profiles, theme });
             state
         }
         Err(e) => {
@@ -270,7 +278,7 @@ fn handle_fetch(
 fn empty_config() -> LoadedConfig {
     use loreread_lua::{AppConfig, GlobalHooks};
     LoadedConfig {
-        config: AppConfig { user: None, profiles: HashMap::new() },
+        config: AppConfig { user: None, theme: "light".to_string(), profiles: HashMap::new() },
         profile_hooks: HashMap::new(),
         global_hooks: GlobalHooks { on_reply: None, on_send: None },
     }

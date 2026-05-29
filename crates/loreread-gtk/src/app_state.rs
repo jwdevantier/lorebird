@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use gio::ListStore;
 use rusqlite::Connection;
 
-use crate::lua_thread::{LuaCommand, LuaResult, LuaThread};
+use crate::lua_thread::{InitResult, LuaCommand, LuaResult, LuaThread};
 use crate::thread_node::ThreadNode;
 use loreread_core::store::DbMessage;
 use loreread_core::thread::{self, Thread};
@@ -43,6 +43,9 @@ pub struct AppState {
 
     /// Resolved profiles (keyed by label), snapshot from config.
     pub profiles: HashMap<String, ResolvedProfile>,
+
+    /// Theme preference from config: "light" or "dark".
+    pub theme: String,
 }
 
 impl AppState {
@@ -51,11 +54,14 @@ impl AppState {
     pub fn new(config_path: Option<&std::path::Path>) -> Self {
         let lua_thread = LuaThread::spawn(config_path.map(|p| p.to_path_buf()));
 
-        let profiles = match lua_thread.recv_init() {
-            Ok(p) => p,
+        let init = match lua_thread.recv_init() {
+            Ok(init) => init,
             Err(e) => {
                 eprintln!("[loreread] warning: {}", e);
-                HashMap::new()
+                InitResult {
+                    profiles: HashMap::new(),
+                    theme: "light".to_string(),
+                }
             }
         };
 
@@ -67,7 +73,8 @@ impl AppState {
             active_maildir: RefCell::new(PathBuf::new()),
             active_query: RefCell::new(None),
             lua_thread,
-            profiles,
+            profiles: init.profiles,
+            theme: init.theme,
         }
     }
 

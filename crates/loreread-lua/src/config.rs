@@ -52,7 +52,14 @@ pub struct ProfileData {
 pub struct AppConfig {
     #[serde(default)]
     pub user: Option<UserInfo>,
+    /// "light" or "dark".  Defaults to "light".
+    #[serde(default = "default_theme")]
+    pub theme: String,
     pub profiles: HashMap<String, ProfileData>,
+}
+
+fn default_theme() -> String {
+    "light".to_string()
 }
 
 // ── Hook types (Lua function handles) ──────────────────────────────
@@ -214,6 +221,7 @@ mod tests {
                 name: Some("Default".to_string()),
                 email: Some("default@example.com".to_string()),
             }),
+            theme: "light".to_string(),
             profiles: {
                 let mut m = HashMap::new();
                 m.insert(

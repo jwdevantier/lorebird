@@ -30,6 +30,12 @@ use crate::thread_node::ThreadNode;
 pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let state_ref = state.borrow();
 
+    // ── Apply theme (dark/light) ──────────────────────────────
+    let is_dark = state_ref.theme == "dark";
+    if let Some(settings) = gtk4::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(is_dark);
+    }
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("loreread")
@@ -116,7 +122,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     // Center + preview
     let (center, selection, preview_labels, search_entry) =
-        build_center_pane(&state_ref.root_model);
+        build_center_pane(&state_ref.root_model, is_dark);
     inner_paned.set_start_child(Some(&center));
     inner_paned.set_shrink_start_child(false);
 
@@ -443,7 +449,7 @@ pub(crate) struct PreviewLabels {
 
 /// Build the centre pane, returning the root widget, the selection model
 /// (for wiring to the preview), and the preview labels.
-fn build_center_pane(root_model: &ListStore) -> (Box, SingleSelection, PreviewLabels, SearchEntry) {
+fn build_center_pane(root_model: &ListStore, is_dark: bool) -> (Box, SingleSelection, PreviewLabels, SearchEntry) {
     let vbox = Box::new(Orientation::Vertical, 0);
 
     // ── Search bar ────────────────────────────────────────────
@@ -474,9 +480,13 @@ fn build_center_pane(root_model: &ListStore) -> (Box, SingleSelection, PreviewLa
     date_label.set_xalign(0.0);
     let body_buffer = sv::Buffer::new(None::<&gtk4::TextTagTable>);
     body_buffer.set_highlight_syntax(true);
-    // Use Adwaita-dark or Adwaita style scheme if available
+    // Sync SourceView style scheme with the app theme
     let style_mgr = sv::StyleSchemeManager::default();
-    if let Some(scheme) = style_mgr.scheme("Adwaita-dark").or_else(|| style_mgr.scheme("Adwaita")) {
+    let scheme_name = if is_dark { "Adwaita-dark" } else { "kate" };
+    let fallback_name = if is_dark { "oblivion" } else { "Adwaita" };
+    if let Some(scheme) = style_mgr.scheme(scheme_name)
+        .or_else(|| style_mgr.scheme(fallback_name))
+    {
         body_buffer.set_style_scheme(Some(&scheme));
     }
     body_buffer.set_text("Select a profile, then click Refresh to load messages.");
