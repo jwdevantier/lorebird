@@ -21,8 +21,11 @@ use sourceview5 as sv;
 use sourceview5::prelude::*;
 
 use crate::app_state::AppState;
+use crate::compose::{self, ComposeContext};
 use crate::folder_item::FolderItem;
+use crate::lua_thread::LuaCommand;
 use crate::thread_node::ThreadNode;
+use loreread_core::compose::ComposeMail;
 
 // ── Public entry point ─────────────────────────────────────────────
 
@@ -133,7 +136,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     outer_paned.set_shrink_start_child(false);
 
     // Center + preview
-    let (center, selection, preview_labels, search_entry) =
+    let (center, selection, column_view, preview_labels, search_entry) =
         build_center_pane(&state_ref.root_model, is_dark);
     inner_paned.set_start_child(Some(&center));
     inner_paned.set_shrink_start_child(false);
@@ -288,6 +291,20 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         set_body_with_highlight(&pl.body_buffer, "");
     });
 
+    // ── Track the currently selected node for Reply ────────────
+    let selected_node: Rc<RefCell<Option<ThreadNode>>> = Rc::new(RefCell::new(None));
+    let selected_node_clone = selected_node.clone();
+    selection.connect_selection_changed(move |sel, _pos, _n| {
+        if let Some(obj) = sel.selected_item()
+            && let Some(row) = obj.downcast_ref::<TreeListRow>()
+            && let Some(node) = row.item().and_downcast::<ThreadNode>()
+        {
+            *selected_node_clone.borrow_mut() = Some(node);
+        } else {
+            *selected_node_clone.borrow_mut() = None;
+        }
+    });
+
     // ── Wire search bar ──────────────────────────────────────────
     // Enter / activate → run search query
     let state_for_search = state.clone();
@@ -323,7 +340,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     // Escape / stop-search → clear search, show all
     let state_for_clear = state.clone();
-    let status_for_clear = status_label;
+    let status_for_clear = status_label.clone();
     search_entry.connect_stop_search(move |entry| {
         entry.set_text("");
         let s = state_for_clear.borrow();
@@ -337,7 +354,185 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         }
     });
 
+    // ── Context menu (right-click on thread list) ─────────────────
+    let context_menu = gtk4::Popover::new();
+    let reply_menu_btn = gtk4::Button::with_label("Reply");
+    reply_menu_btn.add_css_class("flat");
+    reply_menu_btn.set_margin_top(4);
+    reply_menu_btn.set_margin_bottom(4);
+    reply_menu_btn.set_margin_start(8);
+    reply_menu_btn.set_margin_end(8);
+    context_menu.set_child(Some(&reply_menu_btn));
+
+    let state_for_ctx = state.clone();
+    let selected_for_ctx = selected_node.clone();
+    let status_for_ctx = status_label.clone();
+    let app_for_ctx = app.clone();
+    let context_menu_for_btn = context_menu.clone();
+    reply_menu_btn.connect_clicked(move |_btn| {
+        context_menu_for_btn.popdown();
+        trigger_reply(
+            &state_for_ctx,
+            &selected_for_ctx,
+            &app_for_ctx,
+            &status_for_ctx,
+            is_dark,
+        );
+    });
+
+    // Right-click gesture on the column view
+    let ctx_menu_ref = context_menu;
+    let gesture = gtk4::GestureClick::new();
+    gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
+    gesture.connect_pressed(move |gesture, _n, x, y| {
+        let _widget = gesture.widget().unwrap();
+        let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+        ctx_menu_ref.set_pointing_to(Some(&rect));
+        ctx_menu_ref.set_has_arrow(false);
+        ctx_menu_ref.popup();
+    });
+    column_view.add_controller(gesture);
+
+    // ── Ctrl+R keybind for Reply ───────────────────────────────────
+    let state_for_reply = state.clone();
+    let selected_for_reply = selected_node.clone();
+    let status_for_reply = status_label.clone();
+    let app_for_reply = app.clone();
+    let reply_action = gtk4::gio::SimpleAction::new("reply", None);
+    reply_action.connect_activate(move |_action, _param| {
+        trigger_reply(
+            &state_for_reply,
+            &selected_for_reply,
+            &app_for_reply,
+            &status_for_reply,
+            is_dark,
+        );
+    });
+    app.add_action(&reply_action);
+    app.set_accels_for_action("app.reply", &["<Ctrl>R"]);
+
     window.present();
+}
+
+// ── Reply action ────────────────────────────────────────────────────
+
+/// Triggered by Ctrl+R or the context menu Reply button.
+///
+/// Builds a pre-filled `ComposeMail` from the selected message, calls
+/// `on_reply` if the hook exists, and opens the compose window.
+fn trigger_reply(
+    state: &Rc<RefCell<AppState>>,
+    selected_node: &Rc<RefCell<Option<ThreadNode>>>,
+    app: &gtk4::Application,
+    status_label: &Label,
+    is_dark: bool,
+) {
+    let node = match selected_node.borrow().as_ref() {
+        Some(n) => n.clone(),
+        None => {
+            status_label.set_text("No message selected — select a message first");
+            return;
+        }
+    };
+
+    let s = state.borrow();
+    let profile_label = s.active_profile.borrow().clone();
+    if profile_label.is_empty() {
+        status_label.set_text("No profile selected — select a profile first");
+        return;
+    }
+    let profile = match s.profiles.get(&profile_label) {
+        Some(p) => p.clone(),
+        None => {
+            status_label.set_text(&format!("Profile '{}' not found", profile_label));
+            return;
+        }
+    };
+
+    // Build ParentMail from the selected node
+    let parent = loreread_core::compose::ParentMail {
+        message_id: {
+            let mid = node.message_id();
+            if mid.is_empty() { None } else { Some(mid) }
+        },
+        from: node.sender(),
+        to: node.to_addrs(),
+        cc: node.cc_addrs(),
+        subject: node.subject(),
+        date: node.date_str(),
+        references: node.references_str(),
+        in_reply_to: None, // not stored separately; references chain covers it
+        body_text: node.body_preview(),
+    };
+
+    // Build pre-filled reply
+    let mail = ComposeMail::new_reply(&parent, &profile.name, &profile.email,
+    );
+
+    // If on_reply hook exists, dispatch to the Lua thread and poll for result
+    if s.has_on_reply {
+        status_label.set_text("Calling on_reply hook…");
+        match s.lua_thread.send(LuaCommand::Reply {
+            profile_label: profile_label.clone(),
+            parent: parent.clone(),
+            mail: mail.clone(),
+        }) {
+            Ok(()) => {}
+            Err(e) => {
+                status_label.set_text(&format!("Reply error: {}", e));
+                return;
+            }
+        }
+        drop(s); // release borrow before polling
+
+        // Poll for the reply result (blocking with timeout)
+        let state_poll = state.clone();
+        let status_poll = status_label.clone();
+        let _selected_poll = selected_node.clone();
+        let app_poll = app.clone();
+        let profile_label_poll = profile_label.clone();
+        let _profile_poll = profile.clone();
+        let mail_poll = mail.clone();
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            let s = state_poll.borrow();
+            match s.poll_fetch_result() {
+                Some(crate::lua_thread::LuaResult::ReplyDone { mail: modified, error }) => {
+                    if let Some(e) = error {
+                        status_poll.set_text(&format!("on_reply error: {}", e));
+                        // Still open compose with default mail
+                        let ctx = ComposeContext {
+                            profile_label: profile_label_poll.clone(),
+                            mail: mail_poll.clone(),
+                            is_dark,
+                        };
+                        compose::open_compose_window(&app_poll, &state_poll, ctx);
+                    } else {
+                        let final_mail = modified.unwrap_or_else(|| mail_poll.clone());
+                        let ctx = ComposeContext {
+                            profile_label: profile_label_poll.clone(),
+                            mail: final_mail,
+                            is_dark,
+                        };
+                        compose::open_compose_window(&app_poll, &state_poll, ctx);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Some(_) => {
+                    // Unexpected result, keep polling
+                    glib::ControlFlow::Continue
+                }
+                None => glib::ControlFlow::Continue,
+            }
+        });
+    } else {
+        // No on_reply hook — open compose with default pre-filled mail
+        let ctx = ComposeContext {
+            profile_label: profile_label.clone(),
+            mail,
+            is_dark,
+        };
+        compose::open_compose_window(app, state, ctx);
+    }
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────
@@ -481,7 +676,7 @@ pub(crate) struct PreviewLabels {
 
 /// Build the centre pane, returning the root widget, the selection model
 /// (for wiring to the preview), and the preview labels.
-fn build_center_pane(root_model: &ListStore, is_dark: bool) -> (Box, SingleSelection, PreviewLabels, SearchEntry) {
+fn build_center_pane(root_model: &ListStore, is_dark: bool) -> (Box, SingleSelection, ColumnView, PreviewLabels, SearchEntry) {
     let vbox = Box::new(Orientation::Vertical, 0);
 
     // ── Search bar ────────────────────────────────────────────
@@ -541,7 +736,7 @@ fn build_center_pane(root_model: &ListStore, is_dark: bool) -> (Box, SingleSelec
         body_buffer,
     };
 
-    (vbox, selection, preview_labels, search)
+    (vbox, selection, column_view, preview_labels, search)
 }
 
 // ── Thread list (ColumnView + TreeListModel) ──────────────────────

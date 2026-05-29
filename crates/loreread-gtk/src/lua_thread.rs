@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use loreread_lua::{LoadedConfig, ResolvedProfile, Vm};
+use loreread_lua::{ComposeMail, LoadedConfig, ParentMail, ResolvedProfile, Vm};
 
 // ── Command protocol (main → Lua thread) ────────────────────────────
 
@@ -23,6 +23,20 @@ pub enum LuaCommand {
     Fetch {
         profile_label: String,
         maildir: PathBuf,
+    },
+
+    /// Call `on_reply` hook (if present) with parent and pre-filled mail.
+    /// Returns the possibly-modified mail, or None if the hook returned nil.
+    Reply {
+        profile_label: String,
+        parent: ParentMail,
+        mail: ComposeMail,
+    },
+
+    /// Call `on_send` hook with the composed mail.
+    Send {
+        profile_label: String,
+        mail: ComposeMail,
     },
 
     /// Shut down the Lua thread.
@@ -37,6 +51,8 @@ pub enum LuaResult {
         profiles: HashMap<String, ResolvedProfile>,
         theme: String,
         ui_scale: f64,
+        has_on_reply: bool,
+        has_on_send: bool,
     },
 
     /// Config loading failed.
@@ -45,9 +61,22 @@ pub enum LuaResult {
     },
 
     /// Fetch + index operation completed.
+    #[allow(dead_code)]
     FetchDone {
         profile_label: String,
         indexed_count: usize,
+        error: Option<String>,
+    },
+
+    /// Reply hook completed. Carries the possibly-modified mail (or
+    /// None if the hook was absent / returned nil).
+    ReplyDone {
+        mail: Option<ComposeMail>,
+        error: Option<String>,
+    },
+
+    /// Send hook completed.
+    SendDone {
         error: Option<String>,
     },
 }
@@ -66,6 +95,8 @@ pub struct InitResult {
     pub profiles: HashMap<String, ResolvedProfile>,
     pub theme: String,
     pub ui_scale: f64,
+    pub has_on_reply: bool,
+    pub has_on_send: bool,
 }
 
 // ── Lua thread handle ──────────────────────────────────────────────
@@ -96,7 +127,7 @@ impl LuaThread {
     /// Block until the Lua thread has loaded config.
     pub fn recv_init(&self) -> Result<InitResult, String> {
         match self.result_rx.recv() {
-            Ok(LuaResult::InitDone { profiles, theme, ui_scale }) => Ok(InitResult { profiles, theme, ui_scale }),
+            Ok(LuaResult::InitDone { profiles, theme, ui_scale, has_on_reply, has_on_send }) => Ok(InitResult { profiles, theme, ui_scale, has_on_reply, has_on_send }),
             Ok(LuaResult::InitFailed { error }) => Err(error),
             Ok(_) => Err("unexpected result from Lua thread".to_string()),
             Err(_) => Err("Lua thread disconnected during init".to_string()),
@@ -134,7 +165,9 @@ fn lua_thread_main(
             let profiles = state.profiles.clone();
             let theme = state.config.config.theme.clone();
             let ui_scale = state.config.config.ui_scale;
-            let _ = result_tx.send(LuaResult::InitDone { profiles, theme, ui_scale });
+            let has_on_reply = state.config.global_hooks.on_reply.is_some();
+            let has_on_send = state.config.global_hooks.on_send.is_some();
+            let _ = result_tx.send(LuaResult::InitDone { profiles, theme, ui_scale, has_on_reply, has_on_send });
             state
         }
         Err(e) => {
@@ -161,6 +194,22 @@ fn lua_thread_main(
                 let t = std::time::Instant::now();
                 let result = handle_fetch(&state, &profile_label, &maildir);
                 eprintln!("[loreread-lua] Fetch complete in {:?}", t.elapsed());
+                let _ = result_tx.send(result);
+            }
+            Ok(LuaCommand::Reply { profile_label, parent, mail }) => {
+                eprintln!(
+                    "[loreread-lua] Reply: profile='{}'",
+                    profile_label
+                );
+                let result = handle_reply(&state, &profile_label, &parent, &mail);
+                let _ = result_tx.send(result);
+            }
+            Ok(LuaCommand::Send { profile_label, mail }) => {
+                eprintln!(
+                    "[loreread-lua] Send: profile='{}'",
+                    profile_label
+                );
+                let result = handle_send(&state, &profile_label, &mail);
                 let _ = result_tx.send(result);
             }
             Ok(LuaCommand::Shutdown) | Err(_) => {
@@ -295,4 +344,87 @@ fn dirs_for_loreread() -> PathBuf {
             PathBuf::from(home).join(".config")
         })
         .join("loreread")
+}
+
+/// Handle a Reply command: call on_reply hook if present.
+///
+/// If the hook is absent, return the pre-filled mail unchanged.
+/// If the hook returns a table, return the modified mail.
+/// If the hook returns nil, return the pre-filled mail unchanged.
+fn handle_reply(
+    state: &LuaState,
+    profile_label: &str,
+    parent: &ParentMail,
+    mail: &ComposeMail,
+) -> LuaResult {
+    let func = match state.config.global_hooks.on_reply.as_ref() {
+        Some(f) => f,
+        None => {
+            eprintln!("[loreread-lua]   no on_reply hook — using default");
+            return LuaResult::ReplyDone {
+                mail: None,
+                error: None,
+            };
+        }
+    };
+
+    eprintln!("[loreread-lua]   calling on_reply for '{}'...", profile_label);
+    match state.vm.call_on_reply(func, profile_label, parent, mail) {
+        Ok(Some(modified)) => {
+            eprintln!("[loreread-lua]   on_reply returned modified mail");
+            LuaResult::ReplyDone {
+                mail: Some(modified),
+                error: None,
+            }
+        }
+        Ok(None) => {
+            eprintln!("[loreread-lua]   on_reply returned nil — using default");
+            LuaResult::ReplyDone {
+                mail: None,
+                error: None,
+            }
+        }
+        Err(e) => {
+            eprintln!("[loreread-lua]   on_reply error: {}", e);
+            LuaResult::ReplyDone {
+                mail: None,
+                error: Some(format!("on_reply hook failed: {}", e)),
+            }
+        }
+    }
+}
+
+/// Handle a Send command: call on_send hook.
+///
+/// The on_send hook is responsible for delivering the mail (e.g.
+/// via sendmail).  It can use `mail_to_rfc2822()` and `write_tmpfile()`
+/// to format and pipe the message.
+fn handle_send(
+    state: &LuaState,
+    profile_label: &str,
+    mail: &ComposeMail,
+) -> LuaResult {
+    let func = match state.config.global_hooks.on_send.as_ref() {
+        Some(f) => f,
+        None => {
+            eprintln!("[loreread-lua]   no on_send hook — cannot deliver mail");
+            return LuaResult::SendDone {
+                error: Some("no on_send hook configured — mail not delivered".to_string()),
+            };
+        }
+    };
+
+    eprintln!("[loreread-lua]   calling on_send for '{}'...", profile_label);
+    match state.vm.call_on_send(func, profile_label, mail) {
+        Ok(()) => {
+            eprintln!("[loreread-lua]   on_send completed");
+            LuaResult::SendDone { error: None }
+        }
+        Err(e) => {
+            eprintln!("[loreread-lua]   on_send error: {}", e);
+            LuaResult::SendDone {
+                error: Some(format!("on_send hook failed: {}", e)),
+            }
+        }
+    }
 }

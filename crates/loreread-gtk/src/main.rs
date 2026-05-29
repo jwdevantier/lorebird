@@ -1,4 +1,5 @@
 mod app_state;
+mod compose;
 mod folder_item;
 mod lua_thread;
 mod thread_node;

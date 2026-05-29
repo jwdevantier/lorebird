@@ -44,6 +44,12 @@ pub struct AppState {
     /// Resolved profiles (keyed by label), snapshot from config.
     pub profiles: HashMap<String, ResolvedProfile>,
 
+    /// Whether the global on_reply hook is present.
+    pub has_on_reply: bool,
+
+    /// Whether the global on_send hook is present.
+    pub has_on_send: bool,
+
     /// Theme preference from config: "light" or "dark".
     pub theme: String,
 
@@ -66,6 +72,8 @@ impl AppState {
                     profiles: HashMap::new(),
                     theme: "light".to_string(),
                     ui_scale: 1.0,
+                    has_on_reply: false,
+                    has_on_send: false,
                 }
             }
         };
@@ -79,6 +87,8 @@ impl AppState {
             active_query: RefCell::new(None),
             lua_thread,
             profiles: init.profiles,
+            has_on_reply: init.has_on_reply,
+            has_on_send: init.has_on_send,
             theme: init.theme,
             ui_scale: init.ui_scale,
         }
@@ -199,6 +209,9 @@ impl AppState {
                 // Init results are handled synchronously in AppState::new()
                 Err("unexpected init result in fetch handler".to_string())
             }
+            LuaResult::ReplyDone { .. } | LuaResult::SendDone { .. } => {
+                Err("unexpected result in fetch handler".to_string())
+            }
         }
     }
 
@@ -292,20 +305,24 @@ impl ThreadNodeTree {
     fn build_node(t: &Thread<DbMessage>, maildir: &std::path::Path) -> ThreadNode {
         let msg = t.message.as_ref();
 
-        let (from, to, cc, body) = msg
-            .as_ref()
-            .and_then(|m| {
-                loreread_core::store::read_raw_message(maildir, &m.filename)
-                    .map(|parsed| {
-                        (
-                            parsed.from_addr.unwrap_or_else(|| m.from_addr.clone().unwrap_or_default()),
-                            parsed.to_addr.unwrap_or_default(),
-                            parsed.cc_addr.unwrap_or_default(),
-                            parsed.body_text.unwrap_or_default(),
-                        )
-                    })
-            })
-            .unwrap_or_else(|| {
+        // Try to read the full message from disk for rich data.
+        // Fall back to the DB row data when the file is missing.
+        let parsed = msg.as_ref().and_then(|m| {
+            loreread_core::store::read_raw_message(maildir, &m.filename)
+        });
+
+        let (from, to, cc, body, parsed_refs, parsed_date, parsed_mid) =
+            if let Some(ref p) = parsed {
+                (
+                    p.from_addr.clone().unwrap_or_default(),
+                    p.to_addr.clone().unwrap_or_default(),
+                    p.cc_addr.clone().unwrap_or_default(),
+                    p.body_text.clone().unwrap_or_default(),
+                    p.references.join(" "),
+                    p.date_rfc3339.clone().unwrap_or_default(),
+                    p.message_id.clone().unwrap_or_default(),
+                )
+            } else {
                 (
                     msg.as_ref()
                         .and_then(|m| m.from_addr.clone())
@@ -313,8 +330,36 @@ impl ThreadNodeTree {
                     String::new(),
                     String::new(),
                     String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
                 )
-            });
+            };
+
+        // Fall back to the DB row for fields that parsed may not have.
+        let message_id = if parsed_mid.is_empty() {
+            msg.as_ref()
+                .and_then(|m| m.message_id.clone())
+                .unwrap_or_default()
+        } else {
+            parsed_mid
+        };
+
+        let references_str = if parsed_refs.is_empty() {
+            msg.as_ref()
+                .map(|m| m.references.join(" "))
+                .unwrap_or_default()
+        } else {
+            parsed_refs
+        };
+
+        let date_str = if parsed_date.is_empty() {
+            msg.as_ref()
+                .and_then(|m| m.date.clone())
+                .unwrap_or_default()
+        } else {
+            parsed_date
+        };
 
         let subject = msg
             .as_ref()
@@ -332,7 +377,11 @@ impl ThreadNodeTree {
         let last_reply_ts = Self::max_ts(t);
         let last_reply = format_relative_time(last_reply_ts);
 
-        let node = ThreadNode::new(&subject, &from, &to, &cc, &started, &last_reply, started_ts, last_reply_ts);
+        let node = ThreadNode::new(
+            &subject, &from, &to, &cc,
+            &started, &last_reply, started_ts, last_reply_ts,
+            &message_id, &references_str, &date_str,
+        );
         node.set_body_preview(body);
 
         for child in &t.children {

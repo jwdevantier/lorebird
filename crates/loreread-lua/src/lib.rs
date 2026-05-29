@@ -8,16 +8,24 @@
 mod config;
 
 pub use config::{AppConfig, GlobalHooks, LoadedConfig, ProfileData, ProfileHooks, ResolvedProfile, UserInfo, ViewConfig};
+pub use loreread_core::compose::{ComposeMail, ParentMail};
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use mlua::{DeserializeOptions, IntoLua};
 
+/// Temp-file counter for unique filenames.
+static TMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// A Lua VM configured with the loreread API.
 pub struct Vm {
     lua: Lua,
+    /// Paths to temporary files created by `write_tmpfile`,
+    /// cleaned up when the Vm is dropped.
+    temp_files: std::cell::RefCell<Vec<std::path::PathBuf>>,
 }
 
 impl Vm {
@@ -29,7 +37,7 @@ impl Vm {
     /// - `read_file(path)` — read a file's contents as a string
     pub fn new() -> LuaResult<Self> {
         let lua = Lua::new();
-        let vm = Self { lua };
+        let vm = Self { lua, temp_files: std::cell::RefCell::new(Vec::new()) };
         vm.register_helpers()?;
         Ok(vm)
     }
@@ -95,6 +103,32 @@ impl Vm {
         })?;
 
         self.lua.globals().set("read_file", read_file_fn)?;
+
+        // ── write_tmpfile(content) → path ──────────────────────────
+        //   Writes `content` to a unique temporary file and returns
+        //   the path.  Files are cleaned up when the Vm is dropped.
+        let write_tmpfile_fn = self.lua.create_function(|_lua, content: String| {
+            let count = TMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let name = format!("loreread_{}_{}", pid, count);
+            let path = std::env::temp_dir().join(name);
+            std::fs::write(&path, &content).map_err(|e| {
+                mlua::Error::external(format!("write_tmpfile: {}", e))
+            })?;
+            Ok(path.to_string_lossy().to_string())
+        })?;
+
+        self.lua.globals().set("write_tmpfile", write_tmpfile_fn)?;
+
+        // ── mail_to_rfc2822(mail_table) → string ────────────────────
+        //   Converts a mail table (same structure as passed to on_reply /
+        //   on_send) to an RFC 2822 formatted string.
+        let mail_to_rfc2822_fn = self.lua.create_function(|_lua, table: Table| {
+            let mail = extract_compose_mail_from_table(&table)?;
+            Ok(mail.to_rfc2822())
+        })?;
+
+        self.lua.globals().set("mail_to_rfc2822", mail_to_rfc2822_fn)?;
 
         Ok(())
     }
@@ -187,6 +221,53 @@ impl Vm {
         Ok(result)
     }
 
+    /// Call the optional `on_reply` hook.
+    ///
+    /// If the hook is present, passes `(profile_label, parent_table, mail_table)`
+    /// and returns `Ok(Some(modified_mail))` if the hook returned a table,
+    /// or `Ok(None)` if it returned nil.
+    ///
+    /// If the hook is absent, returns `Ok(None)`.
+    pub fn call_on_reply(
+        &self,
+        func: &mlua::Function,
+        profile_label: &str,
+        parent: &ParentMail,
+        mail: &ComposeMail,
+    ) -> LuaResult<Option<ComposeMail>> {
+        let parent_table = build_parent_table(&self.lua, parent)?;
+        let mail_table = build_mail_table(&self.lua, mail)?;
+
+        let result: Value = func.call((profile_label, parent_table, mail_table))?;
+
+        match result {
+            Value::Nil => Ok(None),
+            Value::Table(t) => {
+                let modified = extract_compose_mail_from_table(&t)?;
+                Ok(Some(modified))
+            }
+            _ => Err(mlua::Error::external(
+                "on_reply must return nil or a mail table",
+            )),
+        }
+    }
+
+    /// Call the required `on_send` hook.
+    ///
+    /// Passes `(profile_label, mail_table)`.  The hook can use
+    /// `mail_to_rfc2822()` and `write_tmpfile()` to format and
+    /// deliver the mail.
+    pub fn call_on_send(
+        &self,
+        func: &mlua::Function,
+        profile_label: &str,
+        mail: &ComposeMail,
+    ) -> LuaResult<()> {
+        let mail_table = build_mail_table(&self.lua, mail)?;
+        func.call::<()>((profile_label, mail_table))?;
+        Ok(())
+    }
+
     // ── Legacy ──────────────────────────────────────────────────
 
     /// Evaluate a Lua expression and return the result as a string.
@@ -194,6 +275,103 @@ impl Vm {
         let val: mlua::Value = self.lua.load(code).eval()?;
         Ok(format!("{:?}", val))
     }
+
+    /// Clean up temporary files created by `write_tmpfile`.
+    pub fn cleanup_temp_files(&self) {
+        let paths = self.temp_files.borrow_mut().drain(..).collect::<Vec<_>>();
+        for path in paths {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        self.cleanup_temp_files();
+    }
+}
+
+// ── Lua ↔ Rust conversion helpers ─────────────────────────────────────
+
+/// Build a Lua table from a `ParentMail` struct.
+fn build_parent_table(lua: &Lua, parent: &ParentMail) -> LuaResult<Table> {
+    let table = lua.create_table()?;
+    table.set("message_id", parent.message_id.as_deref().unwrap_or(""))?;
+    table.set("from", parent.from.as_str())?;
+    table.set("to", parent.to.as_str())?;
+    table.set("cc", parent.cc.as_str())?;
+    table.set("subject", parent.subject.as_str())?;
+    table.set("date", parent.date.as_str())?;
+    table.set("references", parent.references.as_str())?;
+    table.set("in_reply_to", parent.in_reply_to.as_deref().unwrap_or(""))?;
+    table.set("body_text", parent.body_text.as_str())?;
+    Ok(table)
+}
+
+/// Build a Lua table from a `ComposeMail` struct.
+fn build_mail_table(lua: &Lua, mail: &ComposeMail) -> LuaResult<Table> {
+    let table = lua.create_table()?;
+    table.set("from", mail.from.as_str())?;
+    table.set("to", mail.to.as_str())?;
+    table.set("cc", mail.cc.as_str())?;
+    table.set("bcc", mail.bcc.as_str())?;
+    table.set("subject", mail.subject.as_str())?;
+
+    if let Some(ref v) = mail.in_reply_to {
+        table.set("in_reply_to", v.as_str())?;
+    }
+    if let Some(ref v) = mail.references {
+        table.set("references", v.as_str())?;
+    }
+
+    table.set("body_text", mail.body_text.as_str())?;
+
+    // Headers sub-table
+    let headers = lua.create_table()?;
+    for (k, v) in &mail.headers {
+        headers.set(k.as_str(), v.as_str())?;
+    }
+    table.set("headers", headers)?;
+
+    Ok(table)
+}
+
+/// Extract a `ComposeMail` from a Lua table.
+///
+/// Missing optional fields default to empty strings or None.
+fn extract_compose_mail_from_table(table: &Table) -> LuaResult<ComposeMail> {
+    let from: String = table.get("from")?;
+    let to: String = table.get("to")?;
+    let cc: String = table.get("cc").unwrap_or_default();
+    let bcc: String = table.get("bcc").unwrap_or_default();
+    let subject: String = table.get("subject")?;
+    let in_reply_to: Option<String> = table.get("in_reply_to")?;
+    let references: Option<String> = table.get("references")?;
+    let body_text: String = table.get("body_text")?;
+
+    let headers: HashMap<String, String> = match table.get::<Table>("headers") {
+        Ok(h) => {
+            let mut map = HashMap::new();
+            for pair in h.pairs::<String, String>() {
+                let (k, v) = pair?;
+                map.insert(k, v);
+            }
+            map
+        }
+        Err(_) => HashMap::new(),
+    };
+
+    Ok(ComposeMail {
+        from,
+        to,
+        cc,
+        bcc,
+        subject,
+        in_reply_to,
+        references,
+        body_text,
+        headers,
+    })
 }
 
 #[cfg(test)]
@@ -405,5 +583,178 @@ config = {
         let hooks = &loaded.profile_hooks["fail"];
         let result = vm.call_on_fetch("fail", hooks).unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    fn write_tmpfile_helper() {
+        let vm = Vm::new().unwrap();
+        let content = "Hello, tmpfile!";
+        let path: String = vm.lua
+            .load(&format!(r#"return write_tmpfile("{}")"#, content.replace('\n', "\\n")))
+            .eval()
+            .unwrap();
+        assert!(!path.is_empty());
+        let read_back = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(read_back, content);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mail_to_rfc2822_helper() {
+        let vm = Vm::new().unwrap();
+        let result: String = vm.lua
+            .load(r#"
+local mail = {
+  from = "Alice <alice@example.com>",
+  to = "Bob <bob@example.com>",
+  cc = "",
+  bcc = "",
+  subject = "Test",
+  in_reply_to = "<parent@example.com>",
+  references = "<grandparent@example.com> <parent@example.com>",
+  body_text = "Hello\n",
+  headers = { ["X-Mailer"] = "loreread" },
+}
+return mail_to_rfc2822(mail)
+"#)
+            .eval()
+            .unwrap();
+        assert!(result.contains("From: Alice <alice@example.com>"));
+        assert!(result.contains("To: Bob <bob@example.com>"));
+        assert!(result.contains("Subject: Test"));
+        assert!(result.contains("In-Reply-To: <parent@example.com>"));
+        assert!(result.contains("X-Mailer: loreread"));
+        assert!(result.contains("Hello"));
+        // Body must be separated from headers by a blank line
+        assert!(result.contains("\nHello\n"));
+    }
+
+    #[test]
+    fn call_on_reply_returns_modified_mail() {
+        let vm = Vm::new().unwrap();
+        let code = r#"
+config = {
+  profiles = {
+    ["test"] = {
+      maildir = "/tmp/test-mail",
+      on_fetch = function(label) return true end,
+    },
+  },
+  on_reply = function(profile, parent, mail)
+    mail.cc = "added-by-hook@example.com"
+    return mail
+  end,
+}
+"#;
+        let loaded = vm.load_config_string(code).unwrap();
+        let on_reply = loaded.global_hooks.on_reply.as_ref().unwrap();
+
+        let parent = loreread_core::compose::ParentMail {
+            message_id: Some("<abc@def>".to_string()),
+            from: "Alice <alice@example.com>".to_string(),
+            to: "list@example.com".to_string(),
+            cc: String::new(),
+            subject: "Test subject".to_string(),
+            date: "2024-01-15".to_string(),
+            references: String::new(),
+            in_reply_to: None,
+            body_text: "Original body".to_string(),
+        };
+        let mail = loreread_core::compose::ComposeMail::new_reply(
+            &parent, "Riccardo", "riccardo@defmacro.it",
+        );
+
+        let result = vm.call_on_reply(on_reply, "test", &parent, &mail).unwrap();
+        assert!(result.is_some());
+        let modified = result.unwrap();
+        assert_eq!(modified.cc, "added-by-hook@example.com");
+        assert_eq!(modified.to, "Alice <alice@example.com>"); // unchanged by hook
+    }
+
+    #[test]
+    fn call_on_reply_returns_nil() {
+        let vm = Vm::new().unwrap();
+        let code = r#"
+config = {
+  profiles = {
+    ["test"] = {
+      maildir = "/tmp/test-mail",
+      on_fetch = function(label) return true end,
+    },
+  },
+  on_reply = function(profile, parent, mail)
+    -- return nil, meaning "use the default"
+    return nil
+  end,
+}
+"#;
+        let loaded = vm.load_config_string(code).unwrap();
+        let on_reply = loaded.global_hooks.on_reply.as_ref().unwrap();
+
+        let parent = loreread_core::compose::ParentMail {
+            message_id: Some("<abc@def>".to_string()),
+            from: "Alice <alice@example.com>".to_string(),
+            to: String::new(),
+            cc: String::new(),
+            subject: "Hello".to_string(),
+            date: String::new(),
+            references: String::new(),
+            in_reply_to: None,
+            body_text: String::new(),
+        };
+        let mail = loreread_core::compose::ComposeMail::new_reply(
+            &parent, "Bob", "bob@example.com",
+        );
+
+        let result = vm.call_on_reply(on_reply, "test", &parent, &mail).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn call_on_send_invokes_hook() {
+        let vm = Vm::new().unwrap();
+        // Use a write_tmpfile-based on_send that we can verify
+        let tmp = std::env::temp_dir().join("loreread_test_on_send.txt");
+        let tmp_path = tmp.display().to_string();
+        let code = format!(r#"
+config = {{
+  profiles = {{
+    ["test"] = {{
+      maildir = "/tmp/test-mail",
+      on_fetch = function(label) return true end,
+    }},
+  }},
+  on_send = function(profile, mail)
+    local fpath = write_tmpfile(mail_to_rfc2822(mail))
+    -- Copy to a known location for the test to check
+    sh({{"cp", fpath, "{}"}})
+  end,
+}}
+"#, tmp_path);
+        let loaded = vm.load_config_string(&code).unwrap();
+        let on_send = loaded.global_hooks.on_send.as_ref().unwrap();
+
+        let mail = loreread_core::compose::ComposeMail {
+            from: "Alice <alice@example.com>".to_string(),
+            to: "Bob <bob@example.com>".to_string(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Test send".to_string(),
+            in_reply_to: None,
+            references: None,
+            body_text: "Hello from send test\n".to_string(),
+            headers: std::collections::HashMap::new(),
+        };
+
+        // The on_send should succeed without error
+        vm.call_on_send(on_send, "test", &mail).unwrap();
+
+        // Verify the file was written
+        if let Ok(content) = std::fs::read_to_string(&tmp) {
+            assert!(content.contains("From: Alice <alice@example.com>"));
+            assert!(content.contains("Subject: Test send"));
+            assert!(content.contains("Hello from send test"));
+            std::fs::remove_file(&tmp).ok();
+        }
     }
 }

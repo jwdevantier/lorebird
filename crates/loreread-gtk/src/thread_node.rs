@@ -47,6 +47,15 @@ mod imp {
         has_children: Cell<bool>,
         #[property(get, set)]
         body_preview: RefCell<String>,
+        /// The Message-ID header of this message (for In-Reply-To).
+        #[property(get, set)]
+        message_id: RefCell<String>,
+        /// Space-separated References header value (for threading Replies).
+        #[property(get, set)]
+        references_str: RefCell<String>,
+        /// Formatted date string (for quote attribution: "On , wrote:").
+        #[property(get, set)]
+        date_str: RefCell<String>,
         /// Children list — not a GObject property, only used by
         /// `TreeListModel` to discover child rows.
         pub children: OnceCell<ListStore>,
@@ -77,6 +86,9 @@ impl ThreadNode {
         last_reply: &str,
         started_ts: i64,
         last_reply_ts: i64,
+        message_id: &str,
+        references_str: &str,
+        date_str: &str,
     ) -> Self {
         glib::Object::builder()
             .property("subject", subject)
@@ -89,6 +101,9 @@ impl ThreadNode {
             .property("last-reply-ts", last_reply_ts)
             .property("has-children", false)
             .property("body-preview", String::new())
+            .property("message-id", message_id)
+            .property("references-str", references_str)
+            .property("date-str", date_str)
             .build()
     }
 
