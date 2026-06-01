@@ -171,34 +171,36 @@ impl Vm {
     /// ```
     pub fn load_config_string(&self, code: &str) -> LuaResult<LoadedConfig> {
         // ── Try return-style first, fall back to global ─────
-        let config_table: Table = match self.lua.load(code).eval() {
-            Ok(Value::Table(t)) => t,
-            Ok(_) => {
-                return Err(mlua::Error::external(
-                    "Config script returned a non-table value",
-                ));
-            }
-            Err(_) => {
-                // Not an expression — likely the legacy `config = { ... }` style.
-                // Execute as a statement block and read from globals.
-                self.lua.load(code).exec()?;
-                self.lua.globals().get("config").map_err(|_| {
-                    mlua::Error::external(
-                        "Config file must either return a table or set a "
-                            .to_string()
-                        + "global 'config' table.\n"
-                        + "\n"
-                        + "Modern style (return a table):\n"
-                        + "  return {\n"
-                        + "    profiles = { ... },\n"
-                        + "  }\n"
-                        + "\n"
-                        + "Legacy style (set global):\n"
-                        + "  config = {\n"
-                        + "    profiles = { ... },\n"
-                        + "  }",
-                    )
-                })?
+        // Return-style: `return { profiles = { ... } }` evaluates to a table.
+        // Statement-style: `config = { ... }` evaluates to nil or fails.
+        // We try eval first, and only accept it if it gives us a table.
+        // Otherwise we exec the script and read `config` from globals.
+        let config_table: Table = {
+            let attempt = self.lua.load(code).eval::<Value>();
+            match attempt {
+                Ok(Value::Table(t)) => t,
+                _ => {
+                    // Either eval failed, or it returned a non-table.
+                    // Execute as a statement block and read from globals.
+                    self.lua.load(code).exec()?;
+                    self.lua.globals().get("config").map_err(|_| {
+                        mlua::Error::external(
+                            "Config file must either return a table or set a "
+                                .to_string()
+                            + "global 'config' table.\n"
+                            + "\n"
+                            + "Modern style (return a table):\n"
+                            + "  return {\n"
+                            + "    profiles = { ... },\n"
+                            + "  }\n"
+                            + "\n"
+                            + "Legacy style (set global):\n"
+                            + "  config = {\n"
+                            + "    profiles = { ... },\n"
+                            + "  }"
+                        )
+                    })?
+                }
             }
         };
 
