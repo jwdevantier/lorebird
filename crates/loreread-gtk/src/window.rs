@@ -584,7 +584,10 @@ fn build_sidebar(state: &AppState) -> (ScrolledWindow, ListStore, gtk4::ListBox)
     if profile_labels.is_empty() {
         sidebar_model.append(&FolderItem::placeholder(
             "No profiles configured.\n\n\
-             Create ~/.config/loreread/config.lua\n\
+             Create a config.lua in your OS config dir:\n\
+               Linux:   ~/.config/loreread/config.lua\n\
+               macOS:   ~/Library/Application Support/loreread/config.lua\n\
+               Windows: %APPDATA%\\loreread\\config.lua\n\
              or start with --config <path>",
         ));
     }

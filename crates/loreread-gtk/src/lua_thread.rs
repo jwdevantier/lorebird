@@ -110,14 +110,14 @@ pub struct LuaThread {
 impl LuaThread {
     /// Spawn the Lua thread.  It creates the VM, loads config, and
     /// sends `InitDone` (or `InitFailed`) back via the result channel.
-    pub fn spawn(config_path: Option<PathBuf>) -> Self {
+    pub fn spawn(loreread_conf_path: Option<PathBuf>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<LuaCommand>();
         let (result_tx, result_rx) = mpsc::channel::<LuaResult>();
 
         std::thread::Builder::new()
             .name("loreread-lua".into())
             .spawn(move || {
-                lua_thread_main(config_path, cmd_rx, result_tx);
+                lua_thread_main(loreread_conf_path, cmd_rx, result_tx);
             })
             .expect("failed to spawn Lua thread");
 
@@ -154,12 +154,12 @@ impl LuaThread {
 // ── Lua thread main loop ───────────────────────────────────────────
 
 fn lua_thread_main(
-    config_path: Option<PathBuf>,
+    loreread_conf_path: Option<PathBuf>,
     cmd_rx: mpsc::Receiver<LuaCommand>,
     result_tx: mpsc::Sender<LuaResult>,
 ) {
     // 1. Create VM and load config (entirely within this thread)
-    let state = match load_config(config_path) {
+    let state = match load_config(loreread_conf_path) {
         Ok(state) => {
             eprintln!("[loreread-lua] loaded {} profile(s)", state.profiles.len());
             let profiles = state.profiles.clone();
@@ -222,11 +222,11 @@ fn lua_thread_main(
 
 /// Load config inside the Lua thread.  Returns `LuaState`.
 fn load_config(
-    config_path: Option<PathBuf>,
+    loreread_conf_path: Option<PathBuf>,
 ) -> Result<LuaState, String> {
     let vm = Vm::new().map_err(|e| format!("failed to create Lua VM: {}", e))?;
 
-    let loaded = match config_path {
+    let loaded = match loreread_conf_path {
         Some(ref path) => vm.load_config_file(path)
             .map_err(|e| format!("failed to load config from {}: {}", path.display(), e))?,
         None => {
@@ -337,13 +337,8 @@ fn empty_config() -> LoadedConfig {
 }
 
 fn dirs_for_loreread() -> PathBuf {
-    std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".config")
-        })
-        .join("loreread")
+    loreread_core::config_dir::loreread_confdir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/loreread"))
 }
 
 /// Handle a Reply command: call on_reply hook if present.
