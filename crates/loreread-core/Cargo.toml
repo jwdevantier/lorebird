@@ -9,16 +9,6 @@ mail-parser = "0.10"
 nom = "7"
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-cfg-if = "1"
-
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-libc = "0.2"
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = [
-    "Win32_System_Com",
-    "Win32_UI_Shell",
-] }
 
 [dev-dependencies]
 tempfile = "3"
