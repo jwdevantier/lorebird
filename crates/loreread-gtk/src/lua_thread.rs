@@ -257,7 +257,7 @@ fn handle_fetch(
     // 2. Call on_fetch hook (if defined)
     if let Some(hooks) = hooks {
         eprintln!("[loreread-lua]   calling on_fetch for '{}'...", profile_label);
-        match state.vm.call_on_fetch(profile_label, hooks) {
+        match state.vm.call_on_fetch(profile_label, maildir.to_str().unwrap_or(""), hooks) {
             Ok(true) => {
                 eprintln!("[loreread-lua]   on_fetch returned true — indexing");
             }

@@ -130,6 +130,32 @@ impl Vm {
 
         self.lua.globals().set("mail_to_rfc2822", mail_to_rfc2822_fn)?;
 
+        // ── lorefetch(maildir, query) → { ok, count?, error? } ──────
+        //   Fetch mail from lore.kernel.org into a maildir.
+        let lorefetch_fn = self.lua.create_function(|lua, (maildir, query): (String, String)| {
+            let result = loreread_lorefetch::fetch_to_maildir(
+                &query,
+                None, // search /all/ by default
+                std::path::Path::new(&maildir),
+                false, // verbose off by default from Lua
+            );
+
+            let table = lua.create_table()?;
+            match result {
+                Ok(count) => {
+                    table.set("ok", true)?;
+                    table.set("count", count)?;
+                }
+                Err(e) => {
+                    table.set("ok", false)?;
+                    table.set("error", e.to_string())?;
+                }
+            }
+            Ok(table)
+        })?;
+
+        self.lua.globals().set("lorefetch", lorefetch_fn)?;
+
         Ok(())
     }
 
@@ -243,6 +269,7 @@ impl Vm {
     pub fn call_on_fetch(
         &self,
         profile_label: &str,
+        maildir: &str,
         hooks: &ProfileHooks,
     ) -> LuaResult<bool> {
         let func = hooks.on_fetch.as_ref().ok_or_else(|| {
@@ -253,7 +280,7 @@ impl Vm {
         })?;
 
         // Lua truthiness: nil/false → false, everything else → true
-        let result: bool = func.call(profile_label)?;
+        let result: bool = func.call((profile_label, maildir))?;
         Ok(result)
     }
 
@@ -432,7 +459,7 @@ config = {
   profiles = {
     ["test"] = {
       maildir = "/tmp/test-mail",
-      on_fetch = function(label)
+      on_fetch = function(label, maildir)
         return true
       end,
     },
@@ -474,7 +501,7 @@ return {
   profiles = {
     ["test"] = {
       maildir = "/tmp/test-mail",
-      on_fetch = function(label) return true end,
+      on_fetch = function(label, maildir) return true end,
     },
   },
 }
@@ -498,7 +525,7 @@ config = {
       name = "Riccardo (work)",
       email = "riccardo@work.com",
       maildir = "/home/nixos/loremail/INBOX",
-      on_fetch = function(label)
+      on_fetch = function(label, maildir)
         return sh({"echo", "fetching"}).ok
       end,
       views = {
@@ -509,7 +536,7 @@ config = {
     ["personal"] = {
       -- inherits global name/email
       maildir = "/home/nixos/loremail/personal",
-      on_fetch = function(label)
+      on_fetch = function(label, maildir)
         return true
       end,
     },
@@ -626,7 +653,7 @@ config = {
         let vm = Vm::new().unwrap();
         let loaded = vm.load_config_string(minimal_config()).unwrap();
         let hooks = &loaded.profile_hooks["test"];
-        let result = vm.call_on_fetch("test", hooks).unwrap();
+        let result = vm.call_on_fetch("test", "/tmp/test-mail", hooks).unwrap();
         assert!(result);
     }
 
@@ -638,7 +665,7 @@ config = {
   profiles = {
     ["fail"] = {
       maildir = "/tmp/none",
-      on_fetch = function(label)
+      on_fetch = function(label, maildir)
         return false
       end,
     },
@@ -647,7 +674,7 @@ config = {
 "#;
         let loaded = vm.load_config_string(code).unwrap();
         let hooks = &loaded.profile_hooks["fail"];
-        let result = vm.call_on_fetch("fail", hooks).unwrap();
+        let result = vm.call_on_fetch("fail", "/tmp/none", hooks).unwrap();
         assert!(!result);
     }
 
@@ -707,7 +734,7 @@ config = {
   profiles = {
     ["test"] = {
       maildir = "/tmp/test-mail",
-      on_fetch = function(label) return true end,
+      on_fetch = function(label, maildir) return true end,
     },
   },
   on_reply = function(profile, parent, mail)
@@ -748,7 +775,7 @@ config = {
   profiles = {
     ["test"] = {
       maildir = "/tmp/test-mail",
-      on_fetch = function(label) return true end,
+      on_fetch = function(label, maildir) return true end,
     },
   },
   on_reply = function(profile, parent, mail)
@@ -793,7 +820,7 @@ config = {{
   profiles = {{
     ["test"] = {{
       maildir = "/tmp/test-mail",
-      on_fetch = function(label) return true end,
+      on_fetch = function(label, maildir) return true end,
     }},
   }},
   on_send = function(profile, mail)
