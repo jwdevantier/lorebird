@@ -1,0 +1,18 @@
+[package]
+name = "loreread-lorefetch"
+version = "0.1.0"
+edition = "2024"
+description = "Fetch mailing-list threads from lore.kernel.org into a maildir"
+
+[dependencies]
+ureq = { version = "3", features = ["json", "cookies", "gzip", "brotli", "charset"] }
+flate2 = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mail-parser = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,12 @@
+[package]
+name = "lorefetch"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "lorefetch"
+path = "src/main.rs"
+
+[dependencies]
+loreread-lorefetch = { path = "../../crates/loreread-lorefetch" }
+clap = { version = "4", features = ["derive"] }

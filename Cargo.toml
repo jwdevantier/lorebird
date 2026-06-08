@@ -3,9 +3,11 @@ members = [
     "crates/loreread-core",
     "crates/loreread-lua",
     "crates/loreread-gtk",
+    "crates/loreread-lorefetch",
     "tools/maildir-index",
     "tools/mail-query",
     "tools/query-test",
     "tools/thread-test",
+    "tools/lorefetch",
 ]
 resolver = "3"
