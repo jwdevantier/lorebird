@@ -70,12 +70,15 @@ fn default_starttls() -> bool {
 }
 
 impl SmtpConfig {
-    /// Evaluate password prefixes at config-load time.
+    /// Resolve the password at call time (not at config-load time).
     ///
     /// If `password` starts with `eval:` or `sh:`, the remainder is
-    /// executed via `sh -c` and the stdout (trimmed) becomes the password.
-    /// Otherwise the password is used as a literal string.
-    pub fn resolve_password(&mut self) -> Result<(), SendError> {
+    /// executed via `sh -c` and the stdout (trimmed) is returned.
+    /// Otherwise the literal password string is returned as-is.
+    ///
+    /// Evaluating at send time (not load time) means rotating tokens
+    /// from `pass` or similar are always fresh.
+    pub fn resolved_password(&self) -> Result<String, SendError> {
         let evaluated = if let Some(cmd) = self.password.strip_prefix("eval:") {
             Some(cmd.to_string())
         } else if let Some(cmd) = self.password.strip_prefix("sh:") {
@@ -84,25 +87,26 @@ impl SmtpConfig {
             None
         };
 
-        if let Some(cmd) = evaluated {
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .output()
-                .map_err(|e| SendError::CommandEval(e.to_string()))?;
+        match evaluated {
+            Some(cmd) => {
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()
+                    .map_err(|e| SendError::CommandEval(e.to_string()))?;
 
-            if !output.status.success() {
-                return Err(SendError::CommandEval(format!(
-                    "password command exited with status {}: {}",
-                    output.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
+                if !output.status.success() {
+                    return Err(SendError::CommandEval(format!(
+                        "password command exited with status {}: {}",
+                        output.status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )));
+                }
+
+                Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
             }
-
-            self.password = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+            None => Ok(self.password.clone()),
         }
-
-        Ok(())
     }
 }
 
@@ -151,7 +155,7 @@ pub fn send(
         .port(config.port)
         .credentials(Credentials::new(
             config.username.clone(),
-            config.password.clone(),
+            config.resolved_password()?,
         ))
         .timeout(Some(Duration::from_secs(60)))
         .build();
@@ -190,46 +194,42 @@ mod tests {
 
     #[test]
     fn password_literal() {
-        let mut config: SmtpConfig = serde_json::from_str(
+        let config: SmtpConfig = serde_json::from_str(
             r#"{"host":"smtp.example.com","username":"u","password":"literal_secret"}"#
         ).unwrap();
-        config.resolve_password().unwrap();
-        assert_eq!(config.password, "literal_secret");
+        assert_eq!(config.resolved_password().unwrap(), "literal_secret");
     }
 
     #[test]
     fn password_eval_prefix() {
-        let mut config: SmtpConfig = serde_json::from_str(
+        let config: SmtpConfig = serde_json::from_str(
             r#"{"host":"smtp.example.com","username":"u","password":"eval:echo hello_secret"}"#
         ).unwrap();
-        config.resolve_password().unwrap();
-        assert_eq!(config.password, "hello_secret");
+        assert_eq!(config.resolved_password().unwrap(), "hello_secret");
     }
 
     #[test]
     fn password_sh_prefix() {
-        let mut config: SmtpConfig = serde_json::from_str(
+        let config: SmtpConfig = serde_json::from_str(
             r#"{"host":"smtp.example.com","username":"u","password":"sh:echo sh_secret"}"#
         ).unwrap();
-        config.resolve_password().unwrap();
-        assert_eq!(config.password, "sh_secret");
+        assert_eq!(config.resolved_password().unwrap(), "sh_secret");
     }
 
     #[test]
     fn password_eval_trims_trailing_newline() {
-        let mut config: SmtpConfig = serde_json::from_str(
+        let config: SmtpConfig = serde_json::from_str(
             r#"{"host":"smtp.example.com","username":"u","password":"eval:echo trimmed"}"#
         ).unwrap();
-        config.resolve_password().unwrap();
-        assert_eq!(config.password, "trimmed");
+        assert_eq!(config.resolved_password().unwrap(), "trimmed");
     }
 
     #[test]
     fn password_eval_failure() {
-        let mut config: SmtpConfig = serde_json::from_str(
+        let config: SmtpConfig = serde_json::from_str(
             r#"{"host":"smtp.example.com","username":"u","password":"eval:false"}"#
         ).unwrap();
-        assert!(config.resolve_password().is_err());
+        assert!(config.resolved_password().is_err());
     }
 
     #[test]

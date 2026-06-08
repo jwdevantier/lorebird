@@ -329,6 +329,11 @@ impl Vm {
         let options = DeserializeOptions::new().deny_unsupported_types(false);
         let app_config: AppConfig = self.lua.from_value_with(config_value, options)?;
 
+        // Note: eval: / sh: password prefixes in smtp.password are NOT
+        // resolved here.  They are resolved at send time by
+        // SmtpConfig::resolved_password(), so that rotating tokens
+        // (e.g. from `pass`) are always fresh.
+
         Ok(LoadedConfig {
             config: app_config,
             profile_hooks,
@@ -1041,6 +1046,94 @@ config = {
         assert!(smtp.starttls);
 
         assert!(resolved["personal"].smtp.is_none());
+    }
+
+    #[test]
+    fn smtp_password_eval_prefix_preserved_at_load_time() {
+        let vm = Vm::new().unwrap();
+        let code = r#"
+config = {
+  profiles = {
+    ["work"] = {
+      maildir = "/tmp/work",
+      smtp = {
+        host     = "smtp.example.com",
+        port     = 587,
+        username = "user@example.com",
+        password = "eval:echo resolved_secret",
+        starttls = true,
+      },
+      on_fetch = function(label, maildir) return true end,
+    },
+  },
+}
+"#;
+        let loaded = vm.load_config_string(code).unwrap();
+        let resolved = loaded.config.resolve_all();
+        let smtp = resolved["work"].smtp.as_ref().unwrap();
+        // The eval: prefix is preserved in the stored config — passwords
+        // are resolved at *send* time, not load time, so that rotating
+        // tokens (e.g. from `pass`) are always fresh.
+        assert_eq!(smtp.password, "eval:echo resolved_secret");
+        // But resolved_password() evaluates it on demand:
+        assert_eq!(smtp.resolved_password().unwrap(), "resolved_secret");
+    }
+
+    #[test]
+    fn smtp_password_sh_prefix_preserved_at_load_time() {
+        let vm = Vm::new().unwrap();
+        let code = r#"
+config = {
+  profiles = {
+    ["work"] = {
+      maildir = "/tmp/work",
+      smtp = {
+        host     = "smtp.example.com",
+        port     = 465,
+        username = "user@example.com",
+        password = "sh:echo sh_secret",
+        starttls = false,
+      },
+      on_fetch = function(label, maildir) return true end,
+    },
+  },
+}
+"#;
+        let loaded = vm.load_config_string(code).unwrap();
+        let resolved = loaded.config.resolve_all();
+        let smtp = resolved["work"].smtp.as_ref().unwrap();
+        // Password prefix preserved; resolved on demand.
+        assert_eq!(smtp.password, "sh:echo sh_secret");
+        assert_eq!(smtp.resolved_password().unwrap(), "sh_secret");
+    }
+
+    #[test]
+    fn smtp_password_eval_failure_returns_send_error() {
+        let vm = Vm::new().unwrap();
+        let code = r#"
+config = {
+  profiles = {
+    ["work"] = {
+      maildir = "/tmp/work",
+      smtp = {
+        host     = "smtp.example.com",
+        port     = 587,
+        username = "user@example.com",
+        password = "eval:false",
+        starttls = true,
+      },
+      on_fetch = function(label, maildir) return true end,
+    },
+  },
+}
+"#;
+        // Config loading should succeed — eval: prefix is preserved.
+        // The failure happens at send time when resolved_password() is called.
+        let loaded = vm.load_config_string(code).unwrap();
+        let resolved = loaded.config.resolve_all();
+        let smtp = resolved["work"].smtp.as_ref().unwrap();
+        assert_eq!(smtp.password, "eval:false"); // prefix preserved
+        assert!(smtp.resolved_password().is_err(), "eval:false should fail at send time");
     }
 
     #[test]
