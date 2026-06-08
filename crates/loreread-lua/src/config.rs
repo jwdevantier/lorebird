@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use loreread_sendmail::SmtpConfig;
 
 // ── Data types (serde-deserialisable) ─────────────────────────────
 
@@ -45,6 +46,8 @@ pub struct ProfileData {
     pub maildir: String,
     #[serde(default)]
     pub views: Vec<ViewConfig>,
+    #[serde(default)]
+    pub smtp: Option<SmtpConfig>,
 }
 
 /// Top-level config data (deserialisable from Lua, **excludes** hooks).
@@ -101,6 +104,7 @@ pub struct ResolvedProfile {
     pub email: String,
     pub maildir: PathBuf,
     pub views: Vec<ViewConfig>,
+    pub smtp: Option<SmtpConfig>,
 }
 
 impl ProfileData {
@@ -125,6 +129,7 @@ impl ProfileData {
                 .to_string(),
             maildir: PathBuf::from(&self.maildir),
             views: self.views.clone(),
+            smtp: self.smtp.clone(),
         }
     }
 }
@@ -173,6 +178,7 @@ mod tests {
                 label: "patches".to_string(),
                 query: "subject:[PATCH]".to_string(),
             }],
+            smtp: None,
         };
         let resolved = data.resolve("test", Some(&make_global()));
         assert_eq!(resolved.name, "Local User");
@@ -189,6 +195,7 @@ mod tests {
             email: None,
             maildir: "/tmp/mail".to_string(),
             views: vec![],
+            smtp: None,
         };
         let resolved = data.resolve("test", Some(&make_global()));
         assert_eq!(resolved.name, "Global User");
@@ -202,6 +209,7 @@ mod tests {
             email: None,
             maildir: "/tmp/mail".to_string(),
             views: vec![],
+            smtp: None,
         };
         let resolved = data.resolve("test", None);
         assert_eq!(resolved.name, "Anonymous");
@@ -216,6 +224,7 @@ mod tests {
             email: None,
             maildir: "/tmp/mail".to_string(),
             views: vec![],
+            smtp: None,
         };
         let resolved = data.resolve("test", Some(&make_global()));
         assert_eq!(resolved.name, "Local Name");
@@ -240,6 +249,7 @@ mod tests {
                         email: Some("work@example.com".to_string()),
                         maildir: "/tmp/work".to_string(),
                         views: vec![],
+                        smtp: None,
                     },
                 );
                 m.insert(
@@ -252,6 +262,7 @@ mod tests {
                             label: "inbox".to_string(),
                             query: "date:1w..".to_string(),
                         }],
+                        smtp: None,
                     },
                 );
                 m
@@ -264,5 +275,41 @@ mod tests {
         assert_eq!(resolved["personal"].name, "Default");
         assert_eq!(resolved["personal"].email, "default@example.com");
         assert_eq!(resolved["personal"].views.len(), 1);
+    }
+
+    #[test]
+    fn resolve_profile_with_smtp() {
+        let data = ProfileData {
+            name: None,
+            email: None,
+            maildir: "/tmp/work".to_string(),
+            views: vec![],
+            smtp: Some(SmtpConfig {
+                host: "smtp.gmail.com".to_string(),
+                port: 587,
+                username: "me@gmail.com".to_string(),
+                password: "secret".to_string(),
+                starttls: true,
+            }),
+        };
+        let resolved = data.resolve("work", None);
+        assert!(resolved.smtp.is_some());
+        let smtp = resolved.smtp.as_ref().unwrap();
+        assert_eq!(smtp.host, "smtp.gmail.com");
+        assert_eq!(smtp.username, "me@gmail.com");
+        assert!(smtp.starttls);
+    }
+
+    #[test]
+    fn resolve_profile_without_smtp() {
+        let data = ProfileData {
+            name: None,
+            email: None,
+            maildir: "/tmp/work".to_string(),
+            views: vec![],
+            smtp: None,
+        };
+        let resolved = data.resolve("work", None);
+        assert!(resolved.smtp.is_none());
     }
 }

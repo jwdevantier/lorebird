@@ -9,6 +9,7 @@ mod config;
 
 pub use config::{AppConfig, GlobalHooks, LoadedConfig, ProfileData, ProfileHooks, ResolvedProfile, UserInfo, ViewConfig};
 pub use loreread_core::compose::{ComposeMail, ParentMail};
+pub use loreread_sendmail::{SendError, SmtpConfig};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -155,6 +156,82 @@ impl Vm {
         })?;
 
         self.lua.globals().set("lorefetch", lorefetch_fn)?;
+
+        // ── send_smtp(rfc2822_text) → { ok, error? } ────────────────
+        //   Send an RFC 2822 message via the profile's SMTP config.
+        //   The SMTP config is set as a Lua global (_loreread_smtp)
+        //   by the send dispatch code before calling on_send.
+        //   If no config is set, returns { ok=false, error="..." }.
+        let send_smtp_fn = self.lua.create_function(|lua, rfc2822: String| {
+            let globals = lua.globals();
+            let smtp_val: mlua::Value = globals.get("_loreread_smtp").unwrap_or(mlua::Value::Nil);
+
+            let table = lua.create_table()?;
+            match smtp_val {
+                mlua::Value::Table(t) => {
+                    // Deserialize the smtp table from Lua
+                    let options = DeserializeOptions::new().deny_unsupported_types(false);
+                    let smtp_config: loreread_sendmail::SmtpConfig =
+                        lua.from_value_with(t.into_lua(lua)?, options)
+                            .map_err(|e| mlua::Error::external(format!("invalid smtp config: {}", e)))?;
+
+                    // Build envelope from the mail headers
+                    let parsed = mail_parser::MessageParser::default()
+                        .parse(rfc2822.as_bytes())
+                        .ok_or_else(|| mlua::Error::external("send_smtp: failed to parse RFC 2822 message"))?;
+
+                    let from_addr = parsed.from()
+                        .and_then(|f| f.first())
+                        .and_then(|m| m.address())
+                        .map(|a| a.to_string())
+                        .unwrap_or_default();
+
+                    let to_addrs: Vec<String> = parsed.to()
+                        .map(|addrs| addrs.iter().filter_map(|a| a.address()).map(|a| a.to_string()).collect())
+                        .unwrap_or_default();
+                    let cc_addrs: Vec<String> = parsed.cc()
+                        .map(|addrs| addrs.iter().filter_map(|a| a.address()).map(|a| a.to_string()).collect())
+                        .unwrap_or_default();
+                    let bcc_addrs: Vec<String> = parsed.bcc()
+                        .map(|addrs| addrs.iter().filter_map(|a| a.address()).map(|a| a.to_string()).collect())
+                        .unwrap_or_default();
+
+                    let all_recipients: Vec<&str> = to_addrs.iter()
+                        .chain(cc_addrs.iter())
+                        .chain(bcc_addrs.iter())
+                        .map(|s| s.as_str())
+                        .collect();
+
+                    if all_recipients.is_empty() {
+                        table.set("ok", false)?;
+                        table.set("error", "no recipients found in message")?;
+                        return Ok(table);
+                    }
+
+                    match loreread_sendmail::send(
+                        &smtp_config,
+                        &from_addr,
+                        &all_recipients,
+                        rfc2822.as_bytes(),
+                    ) {
+                        Ok(()) => {
+                            table.set("ok", true)?;
+                        }
+                        Err(e) => {
+                            table.set("ok", false)?;
+                            table.set("error", e.to_string())?;
+                        }
+                    }
+                }
+                _ => {
+                    table.set("ok", false)?;
+                    table.set("error", "no smtp config for current profile")?;
+                }
+            }
+            Ok(table)
+        })?;
+
+        self.lua.globals().set("send_smtp", send_smtp_fn)?;
 
         Ok(())
     }
@@ -313,15 +390,59 @@ impl Vm {
     ///
     /// Passes `(profile_label, mail_table)`.  The hook can use
     /// `mail_to_rfc2822()` and `write_tmpfile()` to format and
-    /// deliver the mail.
+    /// deliver the mail, or call `send_smtp()` for built-in SMTP.
+    ///
+    /// Before calling the hook, the SMTP config (if any) is set as
+    /// the Lua global `_loreread_smtp` so that `send_smtp()` can
+    /// access it.
     pub fn call_on_send(
         &self,
         func: &mlua::Function,
         profile_label: &str,
         mail: &ComposeMail,
+        smtp: Option<&SmtpConfig>,
     ) -> LuaResult<()> {
+        self.set_smtp_global(smtp)?;
         let mail_table = build_mail_table(&self.lua, mail)?;
         func.call::<()>((profile_label, mail_table))?;
+        Ok(())
+    }
+
+    /// Send mail automatically via built-in SMTP (no on_send hook).
+    ///
+    /// Used when a profile has `smtp` config but no `on_send` hook.
+    pub fn send_smtp_auto(
+        &self,
+        mail: &ComposeMail,
+        smtp: &SmtpConfig,
+    ) -> Result<(), loreread_sendmail::SendError> {
+        let rfc2822 = mail.to_rfc2822();
+
+        // Build envelope from the ComposeMail fields
+        let from = extract_email_address(&mail.from);
+        let mut recipients: Vec<String> = Vec::new();
+        recipients.extend(split_addresses(&mail.to));
+        recipients.extend(split_addresses(&mail.cc));
+        recipients.extend(split_addresses(&mail.bcc));
+
+        let to_refs: Vec<&str> = recipients.iter().map(|s| s.as_str()).collect();
+
+        loreread_sendmail::send(smtp, &from, &to_refs, rfc2822.as_bytes())
+    }
+
+    /// Set or clear the `_loreread_smtp` Lua global.
+    fn set_smtp_global(&self, smtp: Option<&SmtpConfig>) -> LuaResult<()> {
+        let globals = self.lua.globals();
+        match smtp {
+            Some(config) => {
+                // Serialize SmtpConfig to a Lua table
+                let value = self.lua.to_value(&config)?;
+                globals.set("_loreread_smtp", value)?;
+            }
+            None => {
+                globals.set("_loreread_smtp", mlua::Value::Nil)?;
+            }
+        }
         Ok(())
     }
 
@@ -405,6 +526,30 @@ fn build_mail_table(lua: &Lua, mail: &ComposeMail) -> LuaResult<Table> {
     table.set("headers", headers)?;
 
     Ok(table)
+}
+
+/// Extract a bare email address from a header value like
+/// `"Alice \u003calice@example.com\u003e"` or `"alice@example.com"`.
+fn extract_email_address(header: &str) -> String {
+    // If the string contains angle brackets, extract the content
+    if let Some(start) = header.rfind('<') {
+        if let Some(end) = header[start..].find('>') {
+            return header[start + 1..start + end].to_string();
+        }
+    }
+    // Otherwise use the whole string, stripped of whitespace
+    header.trim().to_string()
+}
+
+/// Split a comma-separated address list into individual addresses.
+fn split_addresses(header: &str) -> Vec<String> {
+    if header.trim().is_empty() {
+        return Vec::new();
+    }
+    header.split(',')
+        .map(|s| extract_email_address(s.trim()))
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Extract a `ComposeMail` from a Lua table.
@@ -848,7 +993,7 @@ config = {{
         };
 
         // The on_send should succeed without error
-        vm.call_on_send(on_send, "test", &mail).unwrap();
+        vm.call_on_send(on_send, "test", &mail, None).unwrap();
 
         // Verify the file was written
         if let Ok(content) = std::fs::read_to_string(&tmp) {
@@ -857,5 +1002,70 @@ config = {{
             assert!(content.contains("Hello from send"));
             std::fs::remove_file(&tmp).ok();
         }
+    }
+
+    #[test]
+    fn load_config_with_smtp() {
+        let vm = Vm::new().unwrap();
+        let code = r#"
+local my_smtp = {
+  host = "smtp.example.com",
+  port = 587,
+  username = "user@example.com",
+  password = "secret",
+  starttls = true,
+}
+config = {
+  profiles = {
+    ["work"] = {
+      maildir = "/tmp/work",
+      smtp = my_smtp,
+      on_fetch = function(label, maildir) return true end,
+    },
+    ["personal"] = {
+      maildir = "/tmp/personal",
+      -- no smtp
+      on_fetch = function(label, maildir) return true end,
+    },
+  },
+}
+"#;
+        let loaded = vm.load_config_string(code).unwrap();
+
+        let resolved = loaded.config.resolve_all();
+        assert!(resolved["work"].smtp.is_some());
+        let smtp = resolved["work"].smtp.as_ref().unwrap();
+        assert_eq!(smtp.host, "smtp.example.com");
+        assert_eq!(smtp.port, 587);
+        assert_eq!(smtp.username, "user@example.com");
+        assert!(smtp.starttls);
+
+        assert!(resolved["personal"].smtp.is_none());
+    }
+
+    #[test]
+    fn send_smtp_returns_no_config_error() {
+        let vm = Vm::new().unwrap();
+        let result: mlua::Table = vm.lua
+            .load(r#"return send_smtp("From: test@example.com\nTo: test@example.com\nSubject: Test\n\nHello")"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), false);
+        let err: String = result.get("error").unwrap();
+        assert!(err.contains("no smtp config"));
+    }
+
+    #[test]
+    fn extract_email_address_works() {
+        assert_eq!(super::extract_email_address(r#"Alice <alice@example.com>"#), "alice@example.com");
+        assert_eq!(super::extract_email_address("bob@example.com"), "bob@example.com");
+        assert_eq!(super::extract_email_address(r#"  <c@c.com>  "#), "c@c.com");
+    }
+
+    #[test]
+    fn split_addresses_works() {
+        let addrs = super::split_addresses(r#"Alice <a@x.com>, Bob <b@y.com>"#);
+        assert_eq!(addrs, vec!["a@x.com", "b@y.com"]);
+        assert!(super::split_addresses("").is_empty());
     }
 }
