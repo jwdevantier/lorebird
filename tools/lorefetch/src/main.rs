@@ -108,17 +108,9 @@ fn main() {
         }
     } else if let Some(mbox_path) = args.mbox {
         let client = loreread_lorefetch::LoreClient::new().verbose(verbose);
-        match client.fetch_mbox(&args.query, args.list.as_deref()) {
-            Ok(content) => {
-                if let Err(e) = std::fs::write(&mbox_path, &content) {
-                    eprintln!("Write error: {e}");
-                    std::process::exit(1);
-                }
-                eprintln!(
-                    "Wrote {} lines to {}",
-                    content.lines().count(),
-                    mbox_path.display()
-                );
+        match client.fetch_mbox_to_file(&args.query, args.list.as_deref(), &mbox_path) {
+            Ok(written) => {
+                eprintln!("Wrote {} bytes to {}", written, mbox_path.display());
             }
             Err(e) => {
                 eprintln!("Error: {e}");

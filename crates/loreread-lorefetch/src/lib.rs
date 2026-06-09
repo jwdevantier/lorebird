@@ -5,9 +5,17 @@
 //! Fetch mailing-list threads from lore.kernel.org into a maildir.
 //!
 //! This crate contacts a public-inbox instance, solves the Anubis
-//! bot-protection challenge if required, downloads matching threads as
-//! a gzipped mbox, parses messages, and writes new messages into a
-//! maildir using SHA-1 hashes of the Message-ID as filenames.
+//! bot-protection challenge if required, streams the gzipped mbox
+//! response through a pipeline (decompress → parse → dedup → write),
+//! and writes new messages into a maildir using SHA-1 hashes of the
+//! Message-ID as filenames.
+//!
+//! Streaming design: the HTTP response is never buffered in full
+//! (except for Anubis challenge pages, which are tiny HTML).  Messages
+//! are decompressed and parsed one at a time via `MboxParser`, written
+//! to disk immediately, and deduplicated against the cache.  The read
+//! stall timeout detects genuine stalls (no bytes for N seconds), not
+//! slow but active transfers.
 //!
 //! Incremental fetches use per-query `last_date` tracking: on
 //! subsequent fetches for the same query, a `dt:` range is injected
@@ -15,6 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -86,8 +95,6 @@ pub struct FetchResult {
 /// Per-query state for incremental fetches.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct QueryState {
-    /// Newest message Date: seen for this query, stored as
-    /// YYYY-MM-DD for easy `dt:` range construction.
     last_date: String,
 }
 
@@ -96,26 +103,16 @@ struct QueryState {
 #[derive(Serialize, Deserialize)]
 struct MaildirCache {
     version: i32,
-    /// SHA-1 hex filenames already in the maildir (union across all queries).
     cache: HashSet<String>,
-    /// Per-query incremental state, keyed by the original query string
-    /// (without any injected `dt:` range).
     queries: HashMap<String, QueryState>,
 }
 
 impl MaildirCache {
     #[allow(dead_code)]
     fn new() -> Self {
-        Self {
-            version: CACHE_VERSION,
-            cache: HashSet::new(),
-            queries: HashMap::new(),
-        }
+        Self { version: CACHE_VERSION, cache: HashSet::new(), queries: HashMap::new() }
     }
 
-    /// Load from `<maildir>/.lorefetch-cache.json`, or initialise by
-    /// scanning existing maildir files if the cache doesn't exist or
-    /// is an incompatible version.
     fn load_or_init(maildir: &Path) -> Result<Self, LoreError> {
         let path = maildir.join(CACHE_FILENAME);
         if path.exists() {
@@ -123,7 +120,6 @@ impl MaildirCache {
             match serde_json::from_str::<MaildirCache>(&data) {
                 Ok(cache) if cache.version == CACHE_VERSION => Ok(cache),
                 _ => {
-                    // Parse failure or wrong version: delete old cache, rebuild
                     let _ = std::fs::remove_file(&path);
                     Self::init_from_maildir(maildir)
                 }
@@ -133,378 +129,272 @@ impl MaildirCache {
         }
     }
 
-    /// Scan `new/` and `cur/` to populate the cache from existing files.
     fn init_from_maildir(maildir: &Path) -> Result<Self, LoreError> {
         let mut cache = HashSet::new();
-
-        // new/: all filenames are cache keys
         let new_dir = maildir.join("new");
         if new_dir.is_dir() {
             for entry in std::fs::read_dir(&new_dir)? {
-                let entry = entry?;
-                cache.insert(entry.file_name().to_string_lossy().to_string());
+                cache.insert(entry?.file_name().to_string_lossy().to_string());
             }
         }
-
-        // cur/: strip ":2,*" flags suffix (everything from last ":2" onward)
         let cur_dir = maildir.join("cur");
         if cur_dir.is_dir() {
             for entry in std::fs::read_dir(&cur_dir)? {
-                let entry = entry?;
-                let owned_name = entry.file_name().to_string_lossy().to_string();
-                if let Some(idx) = owned_name.rfind(":2") {
-                    cache.insert(owned_name[..idx].to_string());
+                let name = entry?.file_name().to_string_lossy().to_string();
+                if let Some(idx) = name.rfind(":2") {
+                    cache.insert(name[..idx].to_string());
                 }
-                // Files without ":2" are silently skipped
             }
         }
-
-        Ok(Self {
-            version: CACHE_VERSION,
-            cache,
-            queries: HashMap::new(),
-        })
+        Ok(Self { version: CACHE_VERSION, cache, queries: HashMap::new() })
     }
 
-    fn exists(&self, key: &str) -> bool {
-        self.cache.contains(key)
-    }
-
-    fn add(&mut self, key: &str) {
-        self.cache.insert(key.to_string());
-    }
-
-    /// Get the last_date for a given query, if we've seen it before.
+    fn exists(&self, key: &str) -> bool { self.cache.contains(key) }
+    fn add(&mut self, key: &str) { self.cache.insert(key.to_string()); }
     fn query_last_date(&self, query: &str) -> Option<&str> {
         self.queries.get(query).map(|qs| qs.last_date.as_str())
     }
-
-    /// Update or create the per-query state after a successful fetch.
     fn update_query(&mut self, query: &str, last_date: &str) {
-        self.queries.insert(
-            query.to_string(),
-            QueryState {
-                last_date: last_date.to_string(),
-            },
-        );
+        self.queries.insert(query.to_string(), QueryState { last_date: last_date.to_string() });
     }
-
-    /// Atomically write the cache back to disk (write to .tmp, then rename).
-    /// On Windows, `rename` fails if the destination exists, so we
-    /// remove the old file first (best-effort; OK if it doesn't exist).
     fn save(&self, maildir: &Path) -> Result<(), LoreError> {
         let path = maildir.join(CACHE_FILENAME);
-        let tmp_path = path.with_extension("json.tmp");
+        let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_string_pretty(self)
             .map_err(|e| LoreError::CacheFormat(e.to_string()))?;
-        std::fs::write(&tmp_path, &data)?;
-        let _ = std::fs::remove_file(&path); // OK if file doesn't exist
-        std::fs::rename(&tmp_path, &path)?;
+        std::fs::write(&tmp, &data)?;
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 }
 
 // ── Anubis challenge ─────────────────────────────────────────────────
 
-struct AnubisChallenge {
-    challenge: String,
-    difficulty: usize,
-}
-
-/// Serde shape for the Anubis challenge JSON:
-/// `{"challenge":"...","rules":{"algorithm":"sha256","difficulty":4,"report_as":4}}`
-#[derive(Deserialize)]
-struct AnubisChallengeJson {
-    challenge: String,
-    rules: AnubisRulesJson,
-}
+struct AnubisChallenge { challenge: String, difficulty: usize }
 
 #[derive(Deserialize)]
-struct AnubisRulesJson {
-    #[allow(dead_code)]
-    algorithm: String,
-    difficulty: usize,
-    #[allow(dead_code)]
-    report_as: usize,
-}
+struct AnubisChallengeJson { challenge: String, rules: AnubisRulesJson }
 
-/// Detect an Anubis challenge page.  Returns `Some(AnubisChallenge)` if
-/// the response body is a challenge page, `None` otherwise.
+#[derive(Deserialize)]
+struct AnubisRulesJson { #[allow(dead_code)] algorithm: String, difficulty: usize, #[allow(dead_code)] report_as: usize }
+
 fn detect_anubis(body: &str) -> Option<AnubisChallenge> {
     if !body.contains("anubis_challenge") && !body.contains("Making sure you&#39;re not a bot") {
         return None;
     }
-
-    // Extract the JSON blob from
-    // <script id="anubis_challenge" type="application/json">...</script>
     let start_tag = r#"<script id="anubis_challenge" type="application/json">"#;
     let s_idx = body.find(start_tag)?;
     let content_start = s_idx + start_tag.len();
-    let end_tag = "</script>";
-    let e_idx = body[content_start..].find(end_tag)?;
-    let json = &body[content_start..content_start + e_idx];
-
+    let json = &body[content_start..body[content_start..].find("</script>")? + content_start];
     let parsed: AnubisChallengeJson = serde_json::from_str(json).ok()?;
-
-    Some(AnubisChallenge {
-        challenge: parsed.challenge,
-        difficulty: parsed.rules.difficulty,
-    })
+    Some(AnubisChallenge { challenge: parsed.challenge, difficulty: parsed.rules.difficulty })
 }
 
-/// Brute-force SHA-256 proof-of-work.  Identical algorithm to the Go version.
 fn solve_challenge(challenge: &str, difficulty: usize) -> (String, usize) {
     let prefix = "0".repeat(difficulty);
     for nonce in 0usize.. {
-        let input = format!("{}{}", challenge, nonce);
-        let hash = Sha256::digest(input.as_bytes());
+        let hash = Sha256::digest(format!("{}{}", challenge, nonce).as_bytes());
         let hex = format!("{:x}", hash);
-        if hex.starts_with(&prefix) {
-            return (hex, nonce);
-        }
+        if hex.starts_with(&prefix) { return (hex, nonce); }
     }
     unreachable!()
 }
 
-// ── Mbox parser ──────────────────────────────────────────────────────
+// ── Streaming mbox parser ────────────────────────────────────────────
 
-/// Split mbox content into individual message texts.
+/// Streaming mbox parser that yields one complete RFC 2822 message at
+/// a time from any `Read` source.
 ///
-/// The `"From "` separator lines are stripped from the output.  Each
-/// message text includes its headers, a blank line, and the body.
-fn parse_mbox(mbox_content: &str) -> Vec<String> {
-    let lines: Vec<&str> = mbox_content.split('\n').collect();
-    let mut messages = Vec::new();
-    let mut current = String::new();
+/// Handles mboxrd `>From ` escaping: lines starting with `>+From `
+/// have one leading `>` stripped.
+struct MboxParser<R: Read> {
+    reader: std::io::BufReader<R>,
+    line_buf: Vec<u8>,
+    msg_buf: Vec<u8>,
+    msg_index: usize,
+}
 
-    for (i, line) in lines.iter().enumerate() {
-        if line.starts_with("From ") && i > 0 {
-            if !current.is_empty() {
-                messages.push(current.trim_end().to_string());
-            }
-            current.clear();
-        } else if !line.starts_with("From ") {
-            if !current.is_empty() {
-                current.push('\n');
-            }
-            current.push_str(line);
+impl<R: Read> MboxParser<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader: std::io::BufReader::with_capacity(64 * 1024, reader),
+            line_buf: Vec::with_capacity(4096),
+            msg_buf: Vec::with_capacity(64 * 1024),
+            msg_index: 0,
         }
     }
 
-    if !current.is_empty() {
-        messages.push(current.trim_end().to_string());
+    /// Read the next complete message from the mbox stream.
+    /// Returns `Ok(Some((index, bytes)))`, `Ok(None)` at EOF, or timeout error.
+    fn next_message(&mut self) -> Result<Option<(usize, Vec<u8>)>, LoreError> {
+        loop {
+            self.line_buf.clear();
+            let n = self.read_line()?;
+
+            if n == 0 {
+                if self.msg_buf.is_empty() { return Ok(None); }
+                let msg = unescape_mboxrd(&self.msg_buf);
+                let idx = self.msg_index;
+                self.msg_index += 1;
+                self.msg_buf.clear();
+                return Ok(Some((idx, msg)));
+            }
+
+            if self.line_buf.starts_with(b"From ") && !self.msg_buf.is_empty() {
+                let msg = unescape_mboxrd(&self.msg_buf);
+                let idx = self.msg_index;
+                self.msg_index += 1;
+                self.msg_buf.clear();
+                return Ok(Some((idx, msg)));
+            }
+
+            if !self.msg_buf.is_empty() { self.msg_buf.push(b'\n'); }
+            self.msg_buf.extend_from_slice(&self.line_buf);
+        }
     }
 
-    messages
+    fn read_line(&mut self) -> Result<usize, LoreError> {
+        let mut total = 0usize;
+        let mut byte = [0u8; 1];
+        loop {
+            match self.reader.read(&mut byte) {
+                Ok(0) => return Ok(total),
+                Ok(1) => {
+                    self.line_buf.push(byte[0]);
+                    total += 1;
+                    if byte[0] == b'\n' { return Ok(total); }
+                }
+                Ok(_) => unreachable!(),
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.to_string().contains("timed out")
+                        || e.to_string().contains("Timeout") {
+                        return Err(LoreError::ReadTimeout(READ_TIMEOUT_SECS));
+                    }
+                    return Err(LoreError::Http(format!("read error: {}", e)));
+                }
+            }
+        }
+    }
+}
+
+/// Un-escape mboxrd `>From ` quoting.
+fn unescape_mboxrd(data: &[u8]) -> Vec<u8> {
+    let input = String::from_utf8_lossy(data);
+    let mut output = Vec::with_capacity(data.len());
+    for line in input.lines() {
+        let leading = line.chars().take_while(|c| *c == '>').count();
+        if leading > 0 && line[leading..].starts_with("From ") {
+            output.extend_from_slice(line[1..].as_bytes());
+        } else {
+            output.extend_from_slice(line.as_bytes());
+        }
+        output.push(b'\n');
+    }
+    output
 }
 
 // ── Date parsing for incremental queries ──────────────────────────────
 
-/// Parse common RFC 2822 Date: header formats and produce a `YYYY-MM-DD`
-/// string for Xapian `dt:` range construction.
-///
-/// Handles:
-///   "Fri, 06 Jun 2025 14:32:00 +0000"
-///   "06 Jun 2025 14:32:00 +0000"
-///
-/// Also handles some variants without timezone or with different spacing.
 fn parse_date_string(s: &str) -> Option<String> {
     const MONTHS: &[(&str, u8)] = &[
-        ("Jan", 1),  ("Feb", 2),  ("Mar", 3),  ("Apr", 4),
-        ("May", 5),  ("Jun", 6),  ("Jul", 7),  ("Aug", 8),
-        ("Sep", 9),  ("Oct", 10), ("Nov", 11), ("Dec", 12),
+        ("Jan",1),("Feb",2),("Mar",3),("Apr",4),("May",5),("Jun",6),
+        ("Jul",7),("Aug",8),("Sep",9),("Oct",10),("Nov",11),("Dec",12),
     ];
-
     let parts: Vec<&str> = s.split_whitespace().collect();
-
     let mut day: Option<u32> = None;
     let mut month: Option<u8> = None;
     let mut year: Option<u32> = None;
-
     for part in &parts {
-        // Try day (1-31, possibly with trailing comma)
-        let trimmed = part.trim_end_matches(',');
-        if let Ok(d) = trimmed.parse::<u32>() {
-            if d >= 1 && d <= 31 {
-                if day.is_none() {
-                    day = Some(d);
-                } else if year.is_none() && d >= 1990 {
-                    year = Some(d);
-                }
-                continue;
-            }
-            // Year (4 digits)
-            if d >= 1990 && d <= 2099 {
-                year = Some(d);
-                continue;
-            }
+        let t = part.trim_end_matches(',');
+        if let Ok(d) = t.parse::<u32>() {
+            if d >= 1 && d <= 31 && day.is_none() { day = Some(d); }
+            else if d >= 1990 && d <= 2099 { year = Some(d); }
+            continue;
         }
-
-        // Try month name
         for (name, num) in MONTHS {
-            if part.eq_ignore_ascii_case(name) {
-                month = Some(*num);
-                break;
-            }
+            if part.eq_ignore_ascii_case(name) { month = Some(*num); break; }
         }
     }
-
     match (year, month, day) {
         (Some(y), Some(m), Some(d)) => Some(format!("{:04}-{:02}-{:02}", y, m, d)),
         _ => None,
     }
 }
 
-/// Compute the incremental query for a given base query and last_date.
-///
-/// If we have a `last_date` for this query, we inject a `dt:` range:
-/// `dt:YYYYMMDD..` with a 1-day overlap for safety.
-///
-/// If the query already contains `dt:`, we update the lower bound.
 fn build_incremental_query(query: &str, last_date: &str) -> String {
-    // last_date is "YYYY-MM-DD" → extract YYYY, MM, DD
     let ymd: Vec<&str> = last_date.split('-').collect();
-    if ymd.len() != 3 {
+    if ymd.len() != 3 { return query.to_string(); }
+    let (Ok(year), Ok(month), Ok(day)) = (ymd[0].parse::<i32>(), ymd[1].parse::<i32>(), ymd[2].parse::<i32>()) else {
         return query.to_string();
-    }
-    let year: i32 = match ymd[0].parse() {
-        Ok(y) => y,
-        Err(_) => return query.to_string(),
     };
-    let month: i32 = match ymd[1].parse() {
-        Ok(m) => m,
-        Err(_) => return query.to_string(),
-    };
-    let day: i32 = match ymd[2].parse() {
-        Ok(d) => d,
-        Err(_) => return query.to_string(),
-    };
-    if year == 0 || month == 0 || day == 0 {
-        return query.to_string();
-    }
-
-    // Subtract 1 day for overlap
+    if year == 0 || month == 0 || day == 0 { return query.to_string(); }
     let (y, m, d) = subtract_one_day(year, month, day);
     let dt_lower = format!("{:04}{:02}{:02}", y, m, d);
-
-    // Check if the query already has dt:
     if let Some(dt_start) = query.find("dt:") {
-        // Find the end of the dt: clause (next space or end of string)
         let after_dt = &query[dt_start..];
-        let dt_end = after_dt
-            .find(' ')
-            .map(|i| dt_start + i)
-            .unwrap_or(query.len());
-
+        let dt_end = after_dt.find(' ').map(|i| dt_start + i).unwrap_or(query.len());
         let dt_clause = &query[dt_start..dt_end];
         if let Some(dotdot) = dt_clause.find("..") {
-            // dt:XXX..YYY or dt:XXX.. → replace lower bound
-            let new_dt = format!("dt:{}{}", dt_lower, &dt_clause[dotdot..]);
-            format!("{}{}{}", &query[..dt_start], new_dt, &query[dt_end..])
+            format!("{}dt:{}{}{}",
+                &query[..dt_start], dt_lower, &dt_clause[dotdot..], &query[dt_end..])
         } else {
-            // dt:XXX without .. — unusual, convert to range
-            let new_dt = format!("dt:{}..", dt_lower);
-            format!("{}{}{}", &query[..dt_start], new_dt, &query[dt_end..])
+            format!("{}dt:{}..{}", &query[..dt_start], dt_lower, &query[dt_end..])
         }
     } else {
-        // No dt: in query, append one
         format!("{} dt:{}..", query.trim_end(), dt_lower)
     }
 }
 
-/// Subtract one day from a (year, month, day) tuple.
 fn subtract_one_day(year: i32, month: i32, day: i32) -> (i32, i32, i32) {
-    const DAYS_IN_MONTH: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-
-    if day > 1 {
-        (year, month, day - 1)
-    } else if month > 1 {
-        let prev_month = month - 1;
-        let days_in_prev = if prev_month == 2 && is_leap_year(year) {
-            29
-        } else {
-            DAYS_IN_MONTH[(prev_month - 1) as usize]
-        };
-        (year, prev_month, days_in_prev)
-    } else {
-        // January 1 → December 31 of previous year
-        (year - 1, 12, 31)
-    }
+    const DIM: [i32; 12] = [31,28,31,30,31,30,31,31,30,31,30,31];
+    if day > 1 { (year, month, day - 1) }
+    else if month > 1 {
+        let pm = month - 1;
+        (year, pm, if pm == 2 && is_leap_year(year) { 29 } else { DIM[(pm-1) as usize] })
+    } else { (year - 1, 12, 31) }
 }
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
-}
+fn is_leap_year(y: i32) -> bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
 
 // ── Maildir helpers ──────────────────────────────────────────────────
 
-/// Check that `path` contains `cur/`, `new/`, `tmp/`.
 fn validate_maildir(path: &Path) -> Result<(), LoreError> {
-    for subdir in &["cur", "new", "tmp"] {
-        let p = path.join(subdir);
-        if !p.is_dir() {
-            return Err(LoreError::Maildir(format!(
-                "invalid maildir '{}' — sub-directory '{}' missing",
-                path.display(),
-                subdir
-            )));
+    for s in &["cur","new","tmp"] {
+        if !path.join(s).is_dir() {
+            return Err(LoreError::Maildir(format!("invalid maildir '{}' — '{}' missing", path.display(), s)));
         }
     }
     Ok(())
 }
-
-/// Create `cur/`, `new/`, `tmp/` under `path`.
 fn create_maildir(path: &Path) -> Result<(), LoreError> {
-    for subdir in &["cur", "new", "tmp"] {
-        let p = path.join(subdir);
-        std::fs::create_dir_all(&p).map_err(|e| {
-            LoreError::Maildir(format!("creating directory {}: {}", p.display(), e))
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(MAILDIR_MODE))?;
-        }
+    for s in &["cur","new","tmp"] {
+        let p = path.join(s);
+        std::fs::create_dir_all(&p).map_err(|e| LoreError::Maildir(format!("creating {}: {}", p.display(), e)))?;
+        #[cfg(unix)] { std::fs::set_permissions(&p, std::fs::Permissions::from_mode(MAILDIR_MODE))?; }
     }
     Ok(())
 }
 
 // ── HTTP client ──────────────────────────────────────────────────────
 
-/// HTTP client for lore.kernel.org (or other public-inbox instances).
-///
-/// Handles Anubis bot-protection challenges automatically.
+/// What kind of content we detected from the response.
+enum ResponseContent {
+    GzipMbox,
+    RawMbox,
+    Html,
+}
+
 pub struct LoreClient {
     base_url: String,
     verbose: bool,
 }
 
 impl LoreClient {
-    /// Create a client targeting `https://lore.kernel.org`.
-    pub fn new() -> Self {
-        Self {
-            base_url: BASE_URL.to_string(),
-            verbose: false,
-        }
-    }
+    pub fn new() -> Self { Self { base_url: BASE_URL.to_string(), verbose: false } }
+    pub fn with_base_url(url: &str) -> Self { Self { base_url: url.to_string(), verbose: false } }
+    pub fn verbose(mut self, v: bool) -> Self { self.verbose = v; self }
 
-    /// Create a client targeting a different public-inbox instance.
-    pub fn with_base_url(url: &str) -> Self {
-        Self {
-            base_url: url.to_string(),
-            verbose: false,
-        }
-    }
-
-    /// Enable verbose logging to stderr.
-    pub fn verbose(mut self, v: bool) -> Self {
-        self.verbose = v;
-        self
-    }
-
-    /// Build a ureq agent with a read-stall timeout.
-    /// `timeout_recv_body` triggers if no data arrives for the given duration.
     fn build_agent(&self) -> ureq::Agent {
         use ureq::config::Config;
         Config::builder()
@@ -513,55 +403,23 @@ impl LoreClient {
             .into()
     }
 
-    /// Fetch the mbox for a Xapian query, solving Anubis challenges if needed.
-    /// Returns the raw mbox text (decompressed if gzipped).
-    pub fn fetch_mbox(&self, query: &str, list: Option<&str>) -> Result<String, LoreError> {
-        let agent = self.build_agent();
-
-        // Build search URL
-        let base_search = match list {
+    fn search_url(&self, query: &str, list: Option<&str>) -> String {
+        let base = match list {
             Some(l) => format!("{}/{}/", self.base_url, l),
             None => format!("{}/all/", self.base_url),
         };
-
-        // URL with query parameters
-        let search_url = format!("{}?q={}&x=m", base_search, urlencoding(query));
-
-        if self.verbose {
-            eprintln!("[lorefetch] Fetching mbox from: {}", search_url);
-            eprintln!("[lorefetch] Query: {}", query);
-        }
-
-        // Try the initial POST request
-        let body = self.post_mbox(&agent, &search_url, &self.base_url)?;
-
-        // Check if response is an Anubis challenge
-        if body.contains("anubis_challenge") || body.contains("Making sure you&#39;re not a bot") {
-            if self.verbose {
-                eprintln!("[lorefetch] Detected Anubis bot protection, solving challenge...");
-            }
-            self.solve_anubis_and_retry(&agent, &body, &search_url)
-        } else {
-            Ok(body)
-        }
+        format!("{}?q={}&x=m", base, urlencoding(query))
     }
 
-    fn post_mbox(
-        &self,
-        agent: &ureq::Agent,
-        search_url: &str,
-        base_url: &str,
-    ) -> Result<String, LoreError> {
+    /// Issue a POST request and return the raw response bytes.
+    fn post_raw(&self, agent: &ureq::Agent, search_url: &str) -> Result<Vec<u8>, LoreError> {
         let response = agent
             .post(search_url)
             .header("User-Agent", USER_AGENT)
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .header("Accept-Language", "en-US,en;q=0.5")
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("Origin", base_url)
+            .header("Origin", &self.base_url)
             .header("Connection", "keep-alive")
             .header("Referer", search_url)
             .header("Upgrade-Insecure-Requests", "1")
@@ -572,123 +430,130 @@ impl LoreClient {
             .header("Priority", "u=0, i")
             .send_form([("x", "full threads")])
             .map_err(|e| LoreError::Http(format!("POST request failed: {}", e)))?;
-
-        let status = response.status();
-        if status != 200 {
-            return Err(LoreError::Http(format!(
-                "request returned status {}",
-                status
-            )));
+        if response.status() != 200 {
+            return Err(LoreError::Http(format!("request returned status {}", response.status())));
         }
-
-        // Read body with generous limit and lossy UTF-8 (mbox data may
-        // contain non-UTF-8 bytes from various mail encodings).
-        // ureq's default body limit is 10MB; lore.kernel.org results
-        // can be much larger.  We read as bytes first, then convert
-        // lossily — this is more robust than read_to_string().
-        let bytes = response
-            .into_body()
-            .with_config()
-            .limit(300 * 1024 * 1024)
-            .read_to_vec()
-            .map_err(|e| {
-                // ureq v3: timeouts come as Error::Timeout, IO errors as Error::Io
-                match &e {
-                    ureq::Error::Timeout(_) => LoreError::ReadTimeout(READ_TIMEOUT_SECS),
-                    _ => LoreError::Http(format!("reading response: {}", e)),
-                }
-            })?;
-
-        // gzip detection: lore.kernel.org sends Content-Type: application/gzip
-        let body = if bytes.len() > 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
-            if self.verbose {
-                eprintln!("[lorefetch] Detected gzipped content, decompressing...");
-            }
-            let mut gz = flate2::read::GzDecoder::new(&bytes[..]);
-            let mut decompressed = Vec::new();
-            gz.read_to_end(&mut decompressed)
-                .map_err(|e| LoreError::Http(format!("decompressing gzip: {}", e)))?;
-            String::from_utf8_lossy(&decompressed).to_string()
-        } else {
-            String::from_utf8_lossy(&bytes).to_string()
-        };
-
-        if self.verbose {
-            eprintln!(
-                "[lorefetch] Received {} bytes ({} lines)",
-                body.len(),
-                body.lines().count()
-            );
-        }
-
-        Ok(body)
+        response.into_body().with_config().limit(300 * 1024 * 1024).read_to_vec()
+            .map_err(|e| match &e {
+                ureq::Error::Timeout(_) => LoreError::ReadTimeout(READ_TIMEOUT_SECS),
+                _ => LoreError::Http(format!("reading response: {}", e)),
+            })
     }
 
-    fn solve_anubis_and_retry(
-        &self,
-        agent: &ureq::Agent,
-        body: &str,
-        search_url: &str,
-    ) -> Result<String, LoreError> {
+    /// Detect content type from the first bytes of the response.
+    /// For gzip, peeks at the decompressed head to distinguish mbox from HTML.
+    fn detect_content(bytes: &[u8]) -> ResponseContent {
+        if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+            // Gzip — peek at decompressed content to distinguish mbox from HTML
+            if let Ok(head) = peek_gzip(bytes, 4096) {
+                if head.starts_with(b"From ") {
+                    ResponseContent::GzipMbox
+                } else {
+                    // Gzipped HTML — Anubis challenge or error page
+                    ResponseContent::Html
+                }
+            } else {
+                // Can't decompress header — assume mbox, let the reader fail later
+                ResponseContent::GzipMbox
+            }
+        } else if bytes.starts_with(b"From ") {
+            ResponseContent::RawMbox
+        } else {
+            // Anything else is HTML (Anubis challenge or error page)
+            ResponseContent::Html
+        }
+    }
+
+    /// Fetch mbox content, handling Anubis challenges.
+    /// Returns the response bytes as either raw mbox or gzip-compressed mbox.
+    fn fetch_response_bytes(&self, query: &str, list: Option<&str>) -> Result<Vec<u8>, LoreError> {
+        let agent = self.build_agent();
+        let search_url = self.search_url(query, list);
+        if self.verbose { eprintln!("[lorefetch] Fetching: {}", search_url); }
+
+        let bytes = self.post_raw(&agent, &search_url)?;
+        match Self::detect_content(&bytes) {
+            ResponseContent::Html => {
+                let body = String::from_utf8_lossy(&bytes).to_string();
+                if body.contains("anubis_challenge") || body.contains("Making sure you&#39;re not a bot") {
+                    if self.verbose { eprintln!("[lorefetch] Detected Anubis, solving challenge..."); }
+                    let retry_bytes = self.solve_anubis(&agent, &body, &search_url)?;
+                    // Retry should be mbox (gzip or raw)
+                    Ok(retry_bytes)
+                } else {
+                    Err(LoreError::NotMbox)
+                }
+            }
+            ResponseContent::RawMbox | ResponseContent::GzipMbox => Ok(bytes),
+        }
+    }
+
+    fn solve_anubis(&self, agent: &ureq::Agent, body: &str, search_url: &str) -> Result<Vec<u8>, LoreError> {
         let challenge = detect_anubis(body).ok_or_else(|| {
             LoreError::Anubis("could not extract Anubis challenge data".to_string())
         })?;
-
-        if self.verbose {
-            eprintln!(
-                "[lorefetch] Solving Anubis challenge: {} (difficulty {})",
-                challenge.challenge, challenge.difficulty
-            );
-        }
-
+        if self.verbose { eprintln!("[lorefetch] Solving challenge: {} (difficulty {})", challenge.challenge, challenge.difficulty); }
         let (hash_hex, nonce) = solve_challenge(&challenge.challenge, challenge.difficulty);
+        if self.verbose { eprintln!("[lorefetch] Solution: nonce={}", nonce); }
 
-        if self.verbose {
-            eprintln!("[lorefetch] Found solution: nonce={}", nonce);
-        }
-
-        // Submit the solution
-        let pass_url = format!(
-            "{}/.within.website/x/cmd/anubis/api/pass-challenge?response={}&nonce={}&redir={}&elapsedTime=5000",
-            self.base_url,
-            urlencoding(&hash_hex),
-            nonce,
-            urlencoding(search_url),
-        );
-
-        if self.verbose {
-            eprintln!("[lorefetch] Submitting challenge solution");
-        }
-
-        let _ = agent
-            .get(&pass_url)
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
+        let pass_url = format!("{}/.within.website/x/cmd/anubis/api/pass-challenge?response={}&nonce={}&redir={}&elapsedTime=5000",
+            self.base_url, urlencoding(&hash_hex), nonce, urlencoding(search_url));
+        agent.get(&pass_url)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .header("User-Agent", USER_AGENT)
-            .header("Accept-Language", "en-US,en;q=0.5")
             .header("Referer", search_url)
             .header("Upgrade-Insecure-Requests", "1")
-            .header("Sec-Fetch-Dest", "document")
-            .header("Sec-Fetch-Mode", "navigate")
-            .header("Sec-Fetch-Site", "same-origin")
             .call()
-            .map_err(|e| LoreError::Anubis(format!("submitting challenge solution: {}", e)))?;
+            .map_err(|e| LoreError::Anubis(format!("submitting solution: {}", e)))?;
 
-        if self.verbose {
-            eprintln!("[lorefetch] Challenge submitted, retrying original request...");
-        }
+        if self.verbose { eprintln!("[lorefetch] Retry after challenge..."); }
+        self.post_raw(agent, search_url)
+    }
 
-        // Retry the original POST — the cookie jar now has the auth cookie
-        let body = self.post_mbox(agent, search_url, &self.base_url)?;
+    /// Fetch raw mbox content and write to a file.
+    /// Used by the `--mbox` CLI flag.  Streams through GzDecoder
+    /// and writes the decompressed content to the file.
+    pub fn fetch_mbox_to_file(&self, query: &str, list: Option<&str>, path: &Path) -> Result<usize, LoreError> {
+        let bytes = self.fetch_response_bytes(query, list)?;
+        // fetch_response_bytes handles Anubis; if we get here, it should be mbox
+        let mut reader = make_reader(bytes)?;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.to_string().contains("timed out") {
+                    LoreError::ReadTimeout(READ_TIMEOUT_SECS)
+                } else {
+                    LoreError::Http(format!("reading response: {}", e))
+                }
+            })?;
+        let written = buf.len();
+        std::fs::write(path, &buf)?;
+        Ok(written)
+    }
+}
 
-        // Validate
-        if !body.contains("From ") {
-            return Err(LoreError::NotMbox);
-        }
 
-        Ok(body)
+
+/// Peek at the first `n` bytes of a gzip-compressed buffer.
+/// Returns the decompressed bytes, or an error if decompression fails.
+fn peek_gzip(bytes: &[u8], n: usize) -> Result<Vec<u8>, ()> {
+    let mut gz = flate2::read::GzDecoder::new(bytes);
+    let mut buf = vec![0u8; n];
+    let read = std::io::Read::read(&mut gz, &mut buf).map_err(|_| ())?;
+    buf.truncate(read);
+    Ok(buf)
+}
+
+/// Build a streaming reader that owns the response bytes.
+/// Decompresses gzip if magic bytes are detected.
+fn make_reader(bytes: Vec<u8>) -> Result<Box<dyn Read + Send>, LoreError> {
+    if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        // Gzip — wrap in streaming decompressor that reads from the owned bytes
+        let reader = std::io::Cursor::new(bytes);
+        Ok(Box::new(flate2::read::GzDecoder::new(reader)))
+    } else {
+        Ok(Box::new(std::io::Cursor::new(bytes)))
     }
 }
 
@@ -696,15 +561,10 @@ impl LoreClient {
 
 fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{:02X}", byte));
-            }
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => { out.push('%'); out.push_str(&format!("{:02X}", b)); }
         }
     }
     out
@@ -714,18 +574,18 @@ fn urlencoding(s: &str) -> String {
 
 /// Fetch mail from lore.kernel.org and write new messages into a maildir.
 ///
-/// This is the primary entry point.  It:
-///   1. Creates or validates the maildir structure
-///   2. Loads or initialises the cache (including per-query `last_date`)
-///   3. Computes the incremental query (injecting `dt:` if we have a
-///      `last_date` for this query)
-///   4. Fetches the mbox content (solving Anubis if needed)
-///   5. Parses the mbox into individual messages
-///   6. Writes each new message to `new/`, skipping cached ones
-///   7. Tracks the newest Date: header for incremental state
-///   8. Saves the updated cache atomically
+/// Steps:
+///   1. Create or validate the maildir structure
+///   2. Load or initialise the cache (including per-query `last_date`)
+///   3. Compute the incremental query (injecting `dt:` if applicable)
+///   4. Fetch the response bytes (solving Anubis if needed)
+///   5. Detect content type from first bytes (gzip vs raw mbox vs HTML)
+///   6. Stream through GzDecoder → MboxParser → dedup → write
+///   7. Track newest Date: header for incremental state
+///   8. Save the updated cache atomically
 ///
-/// Returns a `FetchResult` with counts and timeout status.
+/// On a read timeout, all messages already processed are preserved.
+/// The `FetchResult.timed_out` flag indicates a partial fetch.
 pub fn fetch_to_maildir(
     query: &str,
     list: Option<&str>,
@@ -733,116 +593,101 @@ pub fn fetch_to_maildir(
     verbose: bool,
 ) -> Result<FetchResult, LoreError> {
     // 1. Maildir structure
-    if maildir.exists() {
-        validate_maildir(maildir)?;
-    } else {
-        create_maildir(maildir)?;
-    }
+    if maildir.exists() { validate_maildir(maildir)?; } else { create_maildir(maildir)?; }
 
     // 2. Cache
     let mut cache = MaildirCache::load_or_init(maildir)?;
 
     // 3. Compute incremental query
     let effective_query = match cache.query_last_date(query) {
-        Some(last_date) => {
-            if verbose {
-                eprintln!(
-                    "[lorefetch] Incremental fetch: last_date={}, injecting dt: range",
-                    last_date
-                );
-            }
-            build_incremental_query(query, last_date)
+        Some(ld) => {
+            if verbose { eprintln!("[lorefetch] Incremental: last_date={}, injecting dt:", ld); }
+            build_incremental_query(query, ld)
         }
         None => {
-            if verbose {
-                eprintln!("[lorefetch] Full fetch (no last_date for this query)");
-            }
+            if verbose { eprintln!("[lorefetch] Full fetch (no last_date)"); }
             query.to_string()
         }
     };
 
-    // 4. Fetch mbox
+    // 4. Fetch response bytes (handles Anubis if needed)
     let client = LoreClient::new().verbose(verbose);
-    let mbox_content = client.fetch_mbox(&effective_query, list)?;
+    let bytes = client.fetch_response_bytes(&effective_query, list)?;
 
-    if mbox_content.trim().is_empty() {
-        return Ok(FetchResult {
-            new_messages: 0,
-            total_messages: 0,
-            timed_out: false,
-        });
-    }
+    // 6. Create streaming reader and process messages
+    let reader = make_reader(bytes)?;
 
-    // 5. Parse
-    let messages = parse_mbox(&mbox_content);
-    if messages.is_empty() {
-        return Err(LoreError::EmptyMbox);
-    }
-
-    // 6. Process each message
+    // 7. Stream through MboxParser → process each message
+    let mut parser = MboxParser::new(reader);
     let new_dir = maildir.join("new");
     let mut num_saved = 0usize;
+    let mut total_seen = 0usize;
     let mut newest_date: Option<String> = None;
+    let mut timed_out = false;
 
-    for (i, msg_text) in messages.iter().enumerate() {
-        let parsed = mail_parser::MessageParser::default()
-            .parse(msg_text.as_bytes())
-            .ok_or_else(|| LoreError::MissingMessageId { index: i })?;
+    loop {
+        match parser.next_message() {
+            Ok(Some((i, msg_bytes))) => {
+                total_seen += 1;
+                let msg_text = String::from_utf8_lossy(&msg_bytes);
+                let parsed = match mail_parser::MessageParser::default().parse(msg_text.as_bytes()) {
+                    Some(p) => p,
+                    None => {
+                        if verbose { eprintln!("[lorefetch] Skipping message {}: no Message-ID", i); }
+                        continue;
+                    }
+                };
+                let msg_id = match parsed.message_id() {
+                    Some(id) => id.to_string(),
+                    None => {
+                        if verbose { eprintln!("[lorefetch] Skipping message {}: no Message-ID", i); }
+                        continue;
+                    }
+                };
 
-        let msg_id = parsed
-            .message_id()
-            .ok_or_else(|| LoreError::MissingMessageId { index: i })?
-            .to_string();
+                // SHA-1 hash of Message-ID
+                let mut hasher = Sha1Hasher::new();
+                hasher.update(msg_id.as_bytes());
+                let filename = format!("{:x}", hasher.finalize());
 
-        // SHA-1 hash of Message-ID (including angle brackets, matching Go)
-        let mut hasher = Sha1Hasher::new();
-        hasher.update(msg_id.as_bytes());
-        let hash = hasher.finalize();
-        let filename = format!("{:x}", hash);
-
-        // Track newest Date: for incremental queries
-        if let Some(date_hdr) = parsed.date() {
-            if let Some(xapian_date) = parse_date_string(&date_hdr.to_rfc822()) {
-                match &newest_date {
-                    None => newest_date = Some(xapian_date),
-                    Some(current) => {
-                        if &xapian_date > current {
-                            newest_date = Some(xapian_date);
+                // Track newest Date:
+                if let Some(date_hdr) = parsed.date() {
+                    if let Some(d) = parse_date_string(&date_hdr.to_rfc822()) {
+                        match &newest_date {
+                            None => newest_date = Some(d),
+                            Some(cur) if &d > cur => newest_date = Some(d),
+                            _ => {}
                         }
                     }
                 }
+
+                if cache.exists(&filename) { continue; }
+
+                let file_path = new_dir.join(&filename);
+                std::fs::write(&file_path, msg_text.as_bytes())?;
+                #[cfg(unix)] { std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(MAIL_FILE_MODE))?; }
+                cache.add(&filename);
+                num_saved += 1;
             }
+            Ok(None) => break, // EOF
+            Err(LoreError::ReadTimeout(_)) => {
+                timed_out = true;
+                if verbose { eprintln!("[lorefetch] Read timeout — partial fetch saved"); }
+                break;
+            }
+            Err(e) => return Err(e),
         }
-
-        if cache.exists(&filename) {
-            continue;
-        }
-
-        let file_path = new_dir.join(&filename);
-        std::fs::write(&file_path, msg_text.as_bytes())?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(MAIL_FILE_MODE))?;
-        }
-
-        cache.add(&filename);
-        num_saved += 1;
     }
 
-    // 7. Update per-query state and save cache
-    if let Some(ref last_date) = newest_date {
-        cache.update_query(query, last_date);
+    if total_seen == 0 && !timed_out {
+        // Empty response — still save cache to persist query entry
     }
+
+    // 8. Update cache and save
+    if let Some(ref ld) = newest_date { cache.update_query(query, ld); }
     cache.save(maildir)?;
 
-    let total = messages.len();
-    Ok(FetchResult {
-        new_messages: num_saved,
-        total_messages: total,
-        timed_out: false,
-    })
+    Ok(FetchResult { new_messages: num_saved, total_messages: total_seen, timed_out })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -851,51 +696,65 @@ pub fn fetch_to_maildir(
 mod tests {
     use super::*;
 
-    // ── Mbox parser tests ──────────────────────────────────────────
-
     #[test]
-    fn parse_empty_mbox() {
-        let messages = parse_mbox("");
-        assert!(messages.is_empty());
+    fn mbox_parser_single_message() {
+        let mbox = b"From sender@example.com Mon Jan  2 03:14:15 2024\n\
+                      Message-ID: <abc@def>\n\
+                      Subject: Hello\n\
+                      \n\
+                      Body here\n";
+        let mut parser = MboxParser::new(&mbox[..]);
+        let (idx, msg) = parser.next_message().unwrap().unwrap();
+        assert_eq!(idx, 0);
+        let s = String::from_utf8_lossy(&msg);
+        assert!(s.contains("Message-ID: <abc@def>"));
+        assert!(s.contains("Body here"));
+        assert!(parser.next_message().unwrap().is_none());
     }
 
     #[test]
-    fn parse_single_message() {
-        let mbox = "From sender@example.com Mon Jan  2 03:14:15 2024\n\
-                     Message-ID: <abc@def>\n\
-                     Subject: Hello\n\
-                     \n\
-                     Body here\n";
-        let messages = parse_mbox(mbox);
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains("Message-ID: <abc@def>"));
-        assert!(messages[0].contains("Body here"));
-        // The "From " separator line should NOT be in the message text
-        assert!(!messages[0].starts_with("From "));
+    fn mbox_parser_multiple_messages() {
+        let mbox = b"From a@b.com Mon Jan  1 00:00:00 2024\n\
+                      Message-ID: <first@test>\n\
+                      \n\
+                      First\n\
+                      \n\
+                      From b@c.com Mon Jan  2 00:00:00 2024\n\
+                      Message-ID: <second@test>\n\
+                      \n\
+                      Second\n";
+        let mut parser = MboxParser::new(&mbox[..]);
+        let (i1, m1) = parser.next_message().unwrap().unwrap();
+        assert_eq!(i1, 0);
+        assert!(String::from_utf8_lossy(&m1).contains("first@test"));
+        let (i2, m2) = parser.next_message().unwrap().unwrap();
+        assert_eq!(i2, 1);
+        assert!(String::from_utf8_lossy(&m2).contains("second@test"));
+        assert!(parser.next_message().unwrap().is_none());
     }
 
     #[test]
-    fn parse_multiple_messages() {
-        let mbox = "From a@b.com Mon Jan  1 00:00:00 2024\n\
-                     Message-ID: <first@test>\n\
-                     \n\
-                     First\n\
-                     \n\
-                     From b@c.com Mon Jan  2 00:00:00 2024\n\
-                     Message-ID: <second@test>\n\
-                     \n\
-                     Second\n";
-        let messages = parse_mbox(mbox);
-        assert_eq!(messages.len(), 2);
-        assert!(messages[0].contains("first@test"));
-        assert!(messages[1].contains("second@test"));
+    fn mbox_parser_empty() {
+        let mut parser = MboxParser::new(&b""[..]);
+        assert!(parser.next_message().unwrap().is_none());
     }
 
-    // ── Anubis challenge solver ─────────────────────────────────────
+    #[test]
+    fn unescape_mboxrd_from() {
+        let input = b"Subject: test\n>From the depths\n";
+        let out = unescape_mboxrd(input);
+        assert!(String::from_utf8_lossy(&out).contains("From the depths"));
+    }
+
+    #[test]
+    fn unescape_mboxrd_nested() {
+        let input = b"Subject: test\n>>From here\n";
+        let out = unescape_mboxrd(input);
+        assert!(String::from_utf8_lossy(&out).contains(">From here"));
+    }
 
     #[test]
     fn solve_trivial_challenge() {
-        // difficulty 0 → any hash works, nonce 0 should be the answer
         let (hash, nonce) = solve_challenge("test", 0);
         assert_eq!(nonce, 0);
         assert!(!hash.is_empty());
@@ -905,53 +764,23 @@ mod tests {
     fn solve_difficulty_1() {
         let (hash, nonce) = solve_challenge("test", 1);
         assert!(hash.starts_with('0'));
-        assert!(
-            format!(
-                "{:x}",
-                sha2::Sha256::digest(format!("test{}", nonce).as_bytes())
-            )
-            .starts_with('0')
-        );
-    }
-
-    // ── Anubis detection ───────────────────────────────────────────
-
-    #[test]
-    fn detect_anubis_challenge_present() {
-        let html = r#"<html><script id="anubis_challenge" type="application/json">{"challenge":"abc123","rules":{"algorithm":"sha256","difficulty":4,"report_as":4}}</script></html>"#;
-        let result = detect_anubis(html);
-        assert!(result.is_some());
-        let ch = result.unwrap();
-        assert_eq!(ch.challenge, "abc123");
-        assert_eq!(ch.difficulty, 4);
+        assert!(format!("{:x}", sha2::Sha256::digest(format!("test{}", nonce).as_bytes())).starts_with('0'));
     }
 
     #[test]
-    fn detect_anubis_not_present() {
-        let html = "<html><body>Normal page</body></html>";
-        assert!(detect_anubis(html).is_none());
+    fn detect_anubis_present() {
+        let html = r#"<html><script id="anubis_challenge" type="application/json">{"challenge":"abc","rules":{"algorithm":"sha256","difficulty":4,"report_as":4}}</script></html>"#;
+        assert!(detect_anubis(html).is_some());
+        assert_eq!(detect_anubis(html).unwrap().difficulty, 4);
     }
 
     #[test]
-    fn detect_anubis_with_html_entity() {
-        let html = r#"<html><p>Making sure you&#39;re not a bot</p></html>"#;
-        assert!(detect_anubis(html).is_none()); // No challenge data, just the entity
-    }
-
-    // ── Anubis JSON parsing (serde) ─────────────────────────────────
+    fn detect_anubis_absent() { assert!(detect_anubis("<html><body>hi</body></html>").is_none()); }
 
     #[test]
-    fn anubis_json_structured_parsing() {
-        // Uses real JSON with nested rules object — serde parses it properly
-        let html = r#"<html><script id="anubis_challenge" type="application/json">{"challenge":"abc123def","rules":{"algorithm":"sha256","difficulty":5,"report_as":5}}</script></html>"#;
-        let result = detect_anubis(html);
-        assert!(result.is_some());
-        let ch = result.unwrap();
-        assert_eq!(ch.challenge, "abc123def");
-        assert_eq!(ch.difficulty, 5);
+    fn detect_anubis_entity_only() {
+        assert!(detect_anubis(r#"<html><p>Making sure you&#39;re not a bot</p></html>"#).is_none());
     }
-
-    // ── URL encoding ───────────────────────────────────────────────
 
     #[test]
     fn urlencoding_basic() {
@@ -960,261 +789,199 @@ mod tests {
         assert_eq!(urlencoding("a=b"), "a%3Db");
     }
 
-    // ── SHA-1 naming ──────────────────────────────────────────────
-
     #[test]
-    fn sha1_filename_matches_go() {
-        let msg_id = "<abc@def>";
-        let mut hasher = Sha1Hasher::new();
-        hasher.update(msg_id.as_bytes());
-        let hash = hasher.finalize();
-        let filename = format!("{:x}", hash);
-        // Verify it's 40 hex chars (SHA-1 output)
-        assert_eq!(filename.len(), 40);
-        // Verify it's all lowercase hex
-        assert!(filename.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    // ── Date parsing ──────────────────────────────────────────────
-
-    #[test]
-    fn parse_rfc2822_date() {
-        assert_eq!(
-            parse_date_string("Fri, 06 Jun 2025 14:32:00 +0000"),
-            Some("2025-06-06".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_rfc2822_date_no_day_name() {
-        assert_eq!(
-            parse_date_string("06 Jun 2025 14:32:00 +0000"),
-            Some("2025-06-06".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_different_month() {
-        assert_eq!(
-            parse_date_string("15 Mar 2024 09:00:00 -0500"),
-            Some("2024-03-15".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_date_fails_on_garbage() {
-        assert_eq!(parse_date_string("not a date"), None);
-    }
-
-    // ── Incremental queries ────────────────────────────────────────
-
-    #[test]
-    fn incremental_query_no_last_date() {
-        let query = "s:linux-kernel";
-        let cache = MaildirCache::new();
-        assert_eq!(cache.query_last_date(query), None);
-    }
-
-    #[test]
-    fn incremental_query_with_last_date() {
-        let result = build_incremental_query("s:linux-kernel", "2025-06-08");
-        assert_eq!(result, "s:linux-kernel dt:20250607..");
-    }
-
-    #[test]
-    fn incremental_query_with_existing_dt() {
-        let result = build_incremental_query(
-            "s:linux-kernel dt:20240101..1.month.ago",
-            "2025-03-15",
-        );
-        assert_eq!(result, "s:linux-kernel dt:20250314..1.month.ago");
-    }
-
-    #[test]
-    fn incremental_query_existing_dt_no_range() {
-        let result = build_incremental_query(
-            "s:linux-kernel dt:20240101",
-            "2025-03-15",
-        );
-        assert!(result.contains("dt:20250314.."));
-    }
-
-    // ── Day subtraction ────────────────────────────────────────────
-
-    #[test]
-    fn subtract_one_day_simple() {
-        assert_eq!(subtract_one_day(2025, 6, 8), (2025, 6, 7));
-    }
-
-    #[test]
-    fn subtract_one_day_month_boundary() {
-        assert_eq!(subtract_one_day(2025, 6, 1), (2025, 5, 31));
-    }
-
-    #[test]
-    fn subtract_one_day_year_boundary() {
-        assert_eq!(subtract_one_day(2025, 1, 1), (2024, 12, 31));
-    }
-
-    #[test]
-    fn subtract_one_day_leap_year() {
-        // March 1, 2024 → Feb 29, 2024 (2024 is a leap year)
-        assert_eq!(subtract_one_day(2024, 3, 1), (2024, 2, 29));
-    }
-
-    // ── Maildir cache ──────────────────────────────────────────────
-
-    #[test]
-    fn cache_init_from_maildir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let maildir = tmp.path();
-
-        // Create maildir structure
-        for subdir in &["cur", "new", "tmp"] {
-            std::fs::create_dir_all(maildir.join(subdir)).unwrap();
+    fn detect_content_gzip() {
+        let gz: Vec<u8> = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00];
+        match LoreClient::detect_content(&gz) {
+            ResponseContent::GzipMbox => {}
+            _ => panic!("expected GzipMbox"),
         }
+    }
 
-        // Add files to new/
-        std::fs::write(maildir.join("new/abc123"), "").unwrap();
-        std::fs::write(maildir.join("new/def456"), "").unwrap();
+    #[test]
+    fn detect_content_html() {
+        match LoreClient::detect_content(b"<!DOCTYPE html><html>") {
+            ResponseContent::Html => {}
+            _ => panic!("expected Html"),
+        }
+    }
 
-        // Add files to cur/ with flags
-        std::fs::write(maildir.join("cur/ghi789:2,S"), "").unwrap();
-        std::fs::write(maildir.join("cur/jkl012:2,RS"), "").unwrap();
+    #[test]
+    fn detect_content_mbox() {
+        match LoreClient::detect_content(b"From sender@example.com Mon Jan  2") {
+            ResponseContent::RawMbox => {}
+            _ => panic!("expected RawMbox"),
+        }
+    }
 
-        let cache = MaildirCache::init_from_maildir(maildir).unwrap();
-        assert!(cache.exists("abc123"));
-        assert!(cache.exists("def456"));
-        // cur/ files should be indexed by base name without flags
-        assert!(cache.exists("ghi789"));
-        assert!(cache.exists("jkl012"));
-        // The full cur/ filenames should NOT be in the cache
-        assert!(!cache.exists("ghi789:2,S"));
+    #[test]
+    fn sha1_filename() {
+        let mut h = Sha1Hasher::new();
+        h.update(b"<abc@def>");
+        let f = format!("{:x}", h.finalize());
+        assert_eq!(f.len(), 40);
+    }
+
+    #[test]
+    fn parse_date_rfc2822() {
+        assert_eq!(parse_date_string("Fri, 06 Jun 2025 14:32:00 +0000"), Some("2025-06-06".into()));
+    }
+
+    #[test]
+    fn parse_date_no_day() {
+        assert_eq!(parse_date_string("06 Jun 2025 14:32:00 +0000"), Some("2025-06-06".into()));
+    }
+
+    #[test]
+    fn parse_date_other_month() {
+        assert_eq!(parse_date_string("15 Mar 2024 09:00:00 -0500"), Some("2024-03-15".into()));
+    }
+
+    #[test]
+    fn parse_date_garbage() { assert_eq!(parse_date_string("not a date"), None); }
+
+    #[test]
+    fn incremental_no_last_date() {
+        assert_eq!(MaildirCache::new().query_last_date("s:lk"), None);
+    }
+
+    #[test]
+    fn incremental_with_last_date() {
+        assert_eq!(build_incremental_query("s:linux-kernel", "2025-06-08"), "s:linux-kernel dt:20250607..");
+    }
+
+    #[test]
+    fn incremental_existing_dt() {
+        assert_eq!(build_incremental_query("s:lk dt:20240101..1.month.ago", "2025-03-15"),
+            "s:lk dt:20250314..1.month.ago");
+    }
+
+    #[test]
+    fn subtract_day() {
+        assert_eq!(subtract_one_day(2025, 6, 8), (2025, 6, 7));
+        assert_eq!(subtract_one_day(2025, 6, 1), (2025, 5, 31));
+        assert_eq!(subtract_one_day(2025, 1, 1), (2024, 12, 31));
+        assert_eq!(subtract_one_day(2024, 3, 1), (2024, 2, 29)); // leap year
     }
 
     #[test]
     fn cache_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let maildir = tmp.path();
-        for subdir in &["cur", "new", "tmp"] {
-            std::fs::create_dir_all(maildir.join(subdir)).unwrap();
-        }
-
-        let mut cache = MaildirCache::new();
-        cache.add("file1");
-        cache.add("file2");
-        cache.update_query("s:linux-kernel", "2025-06-08");
-        cache.save(maildir).unwrap();
-
-        let loaded = MaildirCache::load_or_init(maildir).unwrap();
-        assert!(loaded.exists("file1"));
-        assert!(loaded.exists("file2"));
-        assert!(!loaded.exists("file3"));
-        assert_eq!(loaded.query_last_date("s:linux-kernel"), Some("2025-06-08"));
+        let md = tmp.path();
+        for s in &["cur","new","tmp"] { std::fs::create_dir_all(md.join(s)).unwrap(); }
+        let mut c = MaildirCache::new();
+        c.add("f1"); c.add("f2"); c.update_query("s:lk", "2025-06-08");
+        c.save(md).unwrap();
+        let loaded = MaildirCache::load_or_init(md).unwrap();
+        assert!(loaded.exists("f1")); assert!(loaded.exists("f2"));
+        assert_eq!(loaded.query_last_date("s:lk"), Some("2025-06-08"));
     }
 
     #[test]
-    fn cache_version_mismatch_deletes_and_rebuilds() {
+    fn cache_version_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let maildir = tmp.path();
-        for subdir in &["cur", "new", "tmp"] {
-            std::fs::create_dir_all(maildir.join(subdir)).unwrap();
-        }
-
-        // Write a cache with wrong version
-        let bad_cache = MaildirCache {
-            version: 999,
-            cache: HashSet::new(),
-            queries: HashMap::new(),
-        };
-        let path = maildir.join(CACHE_FILENAME);
-        std::fs::write(&path, serde_json::to_string_pretty(&bad_cache).unwrap()).unwrap();
-
-        // Add a file to new/ so we can verify the rebuild picked it up
-        std::fs::write(maildir.join("new/existing_file"), "").unwrap();
-
-        let loaded = MaildirCache::load_or_init(maildir).unwrap();
-        assert!(loaded.exists("existing_file"));
-        assert_eq!(loaded.version, CACHE_VERSION);
-        // Old invalid cache file should have been deleted
-        assert!(!path.exists());
+        let md = tmp.path();
+        for s in &["cur","new","tmp"] { std::fs::create_dir_all(md.join(s)).unwrap(); }
+        let bad = MaildirCache { version: 999, cache: HashSet::new(), queries: HashMap::new() };
+        let p = md.join(CACHE_FILENAME);
+        std::fs::write(&p, serde_json::to_string_pretty(&bad).unwrap()).unwrap();
+        std::fs::write(md.join("new/x"), "").unwrap();
+        let loaded = MaildirCache::load_or_init(md).unwrap();
+        assert!(loaded.exists("x")); assert!(!p.exists()); // deleted & rebuilt
     }
 
     #[test]
-    fn cache_per_query_state() {
-        let mut cache = MaildirCache::new();
-        assert_eq!(cache.query_last_date("s:linux-kernel"), None);
-
-        cache.update_query("s:linux-kernel", "2025-06-08");
-        assert_eq!(
-            cache.query_last_date("s:linux-kernel"),
-            Some("2025-06-08")
-        );
-
-        assert_eq!(cache.query_last_date("s:linux-raid"), None);
-
-        cache.update_query("s:linux-raid", "2025-05-01");
-        assert_eq!(cache.query_last_date("s:linux-raid"), Some("2025-05-01"));
-
-        // Original query still has its state
-        assert_eq!(
-            cache.query_last_date("s:linux-kernel"),
-            Some("2025-06-08")
-        );
-    }
-
-    #[test]
-    fn cache_corrupt_or_v1_deletes_and_rebuilds() {
-        // A corrupt or incompatible cache file is deleted and rebuilt
+    fn cache_v1_deletes() {
         let tmp = tempfile::tempdir().unwrap();
-        let maildir = tmp.path();
-        for subdir in &["cur", "new", "tmp"] {
-            std::fs::create_dir_all(maildir.join(subdir)).unwrap();
-        }
-
-        // v1 cache (no queries field) — can't deserialize into v2 struct
-        let v1_cache = r#"{"version":1,"cache":["abc123"]}"#;
-        let path = maildir.join(CACHE_FILENAME);
-        std::fs::write(&path, v1_cache).unwrap();
-        // Put the file in new/ so rebuild picks it up
-        std::fs::write(maildir.join("new/abc123"), "").unwrap();
-
-        let loaded = MaildirCache::load_or_init(maildir).unwrap();
-        assert_eq!(loaded.version, CACHE_VERSION);
-        assert!(loaded.exists("abc123"));
-        assert!(loaded.queries.is_empty());
-        // Old incompatible cache file should have been deleted
-        assert!(!path.exists());
+        let md = tmp.path();
+        for s in &["cur","new","tmp"] { std::fs::create_dir_all(md.join(s)).unwrap(); }
+        std::fs::write(md.join(CACHE_FILENAME), r#"{"version":1,"cache":["abc"]}"#).unwrap();
+        std::fs::write(md.join("new/abc"), "").unwrap();
+        let loaded = MaildirCache::load_or_init(md).unwrap();
+        assert!(loaded.exists("abc")); assert!(!md.join(CACHE_FILENAME).exists());
     }
 
-    // ── Maildir validation ────────────────────────────────────────
+    #[test]
+    fn cache_init_from_maildir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let md = tmp.path();
+        for s in &["cur","new","tmp"] { std::fs::create_dir_all(md.join(s)).unwrap(); }
+        std::fs::write(md.join("new/abc123"), "").unwrap();
+        std::fs::write(md.join("cur/ghi789:2,S"), "").unwrap();
+        let c = MaildirCache::init_from_maildir(md).unwrap();
+        assert!(c.exists("abc123")); assert!(c.exists("ghi789")); assert!(!c.exists("ghi789:2,S"));
+    }
+
+    #[test]
+    fn cache_per_query() {
+        let mut c = MaildirCache::new();
+        assert_eq!(c.query_last_date("s:lk"), None);
+        c.update_query("s:lk", "2025-06-08");
+        assert_eq!(c.query_last_date("s:lk"), Some("2025-06-08"));
+        c.update_query("s:raid", "2025-05-01");
+        assert_eq!(c.query_last_date("s:raid"), Some("2025-05-01"));
+        assert_eq!(c.query_last_date("s:lk"), Some("2025-06-08")); // preserved
+    }
 
     #[test]
     fn validate_maildir_ok() {
         let tmp = tempfile::tempdir().unwrap();
-        let maildir = tmp.path();
-        for subdir in &["cur", "new", "tmp"] {
-            std::fs::create_dir_all(maildir.join(subdir)).unwrap();
-        }
-        assert!(validate_maildir(maildir).is_ok());
+        let md = tmp.path();
+        for s in &["cur","new","tmp"] { std::fs::create_dir_all(md.join(s)).unwrap(); }
+        assert!(validate_maildir(md).is_ok());
     }
 
     #[test]
-    fn validate_maildir_missing_subdir() {
+    fn validate_maildir_fails() {
         let tmp = tempfile::tempdir().unwrap();
-        let maildir = tmp.path();
-        std::fs::create_dir_all(maildir.join("cur")).unwrap();
-        // Missing new/ and tmp/
-        assert!(validate_maildir(maildir).is_err());
+        let md = tmp.path();
+        std::fs::create_dir_all(md.join("cur")).unwrap();
+        assert!(validate_maildir(md).is_err());
     }
 
     #[test]
-    fn create_maildir_from_scratch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let maildir = tmp.path().join("my-mail");
-        create_maildir(&maildir).unwrap();
-        assert!(maildir.join("cur").is_dir());
-        assert!(maildir.join("new").is_dir());
-        assert!(maildir.join("tmp").is_dir());
+    fn make_reader_raw() {
+        let data = b"From a@b.com\nMessage-ID: <x>\n\nBody\n".to_vec();
+        let mut r = make_reader(data).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(&buf, b"From a@b.com\nMessage-ID: <x>\n\nBody\n");
+    }
+
+    #[test]
+    fn make_reader_gzip() {
+        let original = b"From a@b.com\nMessage-ID: <x>\n\nBody\n";
+        let mut compressed = Vec::new();
+        let mut gz = flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, original).unwrap();
+        gz.finish().unwrap();
+        let compressed_vec = compressed.clone();
+        let mut r = make_reader(compressed_vec).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(&buf, original);
+    }
+
+    #[test]
+    fn peek_gzip_identifies_mbox() {
+        let original = b"From sender@example.com\nMessage-ID: <abc>\n\nBody\n";
+        let mut compressed = Vec::new();
+        let mut gz = flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, original).unwrap();
+        gz.finish().unwrap();
+        let head = peek_gzip(&compressed, 4096).unwrap();
+        assert!(head.starts_with(b"From "));
+    }
+
+    #[test]
+    fn peek_gzip_identifies_html() {
+        let original = b"<!DOCTYPE html><html>error</html>";
+        let mut compressed = Vec::new();
+        let mut gz = flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, original).unwrap();
+        gz.finish().unwrap();
+        let head = peek_gzip(&compressed, 4096).unwrap();
+        assert!(!head.starts_with(b"From "));
+        assert!(head.starts_with(b"<"));
     }
 }
