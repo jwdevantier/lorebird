@@ -143,9 +143,13 @@ impl Vm {
 
             let table = lua.create_table()?;
             match result {
-                Ok(count) => {
+                Ok(r) => {
                     table.set("ok", true)?;
-                    table.set("count", count)?;
+                    table.set("count", r.total_messages)?;
+                    table.set("new", r.new_messages)?;
+                    if r.timed_out {
+                        table.set("timed_out", true)?;
+                    }
                 }
                 Err(e) => {
                     table.set("ok", false)?;

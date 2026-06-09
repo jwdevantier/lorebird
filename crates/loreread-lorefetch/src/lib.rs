@@ -4,15 +4,19 @@
 
 //! Fetch mailing-list threads from lore.kernel.org into a maildir.
 //!
-//! This crate is a faithful Rust port of the Go `lorefetch` program.
-//! It contacts a public-inbox instance, solves the Anubis bot-protection
-//! challenge if required, downloads matching threads as mbox, parses them,
-//! and writes new messages into a maildir using SHA-1 hashes of the
-//! Message-ID as filenames.
+//! This crate contacts a public-inbox instance, solves the Anubis
+//! bot-protection challenge if required, downloads matching threads as
+//! a gzipped mbox, parses messages, and writes new messages into a
+//! maildir using SHA-1 hashes of the Message-ID as filenames.
+//!
+//! Incremental fetches use per-query `last_date` tracking: on
+//! subsequent fetches for the same query, a `dt:` range is injected
+//! to only pull new mail (with a 1-day overlap for safety).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1 as Sha1Hasher};
@@ -22,8 +26,9 @@ use sha2::Sha256;
 
 const BASE_URL: &str = "https://lore.kernel.org";
 const USER_AGENT: &str = "Lorefetch/1.x (https://github.com/jwdevantier/lorefetch)";
-const _FETCH_TIMEOUT_SECS: u64 = 60;
-const CACHE_VERSION: i32 = 1;
+/// Read stall timeout: if no bytes arrive for this many seconds, abort.
+const READ_TIMEOUT_SECS: u64 = 30;
+const CACHE_VERSION: i32 = 2;
 const CACHE_FILENAME: &str = ".lorefetch-cache.json";
 
 #[cfg(unix)]
@@ -58,14 +63,44 @@ pub enum LoreError {
 
     #[error("Response is not mbox format")]
     NotMbox,
+
+    #[error("Read timeout: no data received for {0}s")]
+    ReadTimeout(u64),
+}
+
+// ── Result type ──────────────────────────────────────────────────────
+
+/// Result of a fetch operation.
+#[derive(Debug)]
+pub struct FetchResult {
+    /// Number of new messages written to the maildir.
+    pub new_messages: usize,
+    /// Total messages seen (new + already cached).
+    pub total_messages: usize,
+    /// Whether a read timeout occurred (partial data may have been saved).
+    pub timed_out: bool,
 }
 
 // ── Cache ─────────────────────────────────────────────────────────────
 
+/// Per-query state for incremental fetches.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct QueryState {
+    /// Newest message Date: seen for this query, stored as
+    /// YYYY-MM-DD for easy `dt:` range construction.
+    last_date: String,
+}
+
+/// Maildir cache: tracks which SHA-1 filenames exist on disk and
+/// per-query incremental state.
 #[derive(Serialize, Deserialize)]
 struct MaildirCache {
     version: i32,
+    /// SHA-1 hex filenames already in the maildir (union across all queries).
     cache: HashSet<String>,
+    /// Per-query incremental state, keyed by the original query string
+    /// (without any injected `dt:` range).
+    queries: HashMap<String, QueryState>,
 }
 
 impl MaildirCache {
@@ -74,22 +109,25 @@ impl MaildirCache {
         Self {
             version: CACHE_VERSION,
             cache: HashSet::new(),
+            queries: HashMap::new(),
         }
     }
 
     /// Load from `<maildir>/.lorefetch-cache.json`, or initialise by
-    /// scanning existing maildir files if the cache doesn't exist.
+    /// scanning existing maildir files if the cache doesn't exist or
+    /// is an incompatible version.
     fn load_or_init(maildir: &Path) -> Result<Self, LoreError> {
         let path = maildir.join(CACHE_FILENAME);
         if path.exists() {
             let data = std::fs::read_to_string(&path)?;
-            let cache: MaildirCache =
-                serde_json::from_str(&data).map_err(|e| LoreError::CacheFormat(e.to_string()))?;
-            if cache.version != CACHE_VERSION {
-                // Version mismatch → rebuild from scratch
-                return Self::init_from_maildir(maildir);
+            match serde_json::from_str::<MaildirCache>(&data) {
+                Ok(cache) if cache.version == CACHE_VERSION => Ok(cache),
+                _ => {
+                    // Parse failure or wrong version: delete old cache, rebuild
+                    let _ = std::fs::remove_file(&path);
+                    Self::init_from_maildir(maildir)
+                }
             }
-            Ok(cache)
         } else {
             Self::init_from_maildir(maildir)
         }
@@ -124,6 +162,7 @@ impl MaildirCache {
         Ok(Self {
             version: CACHE_VERSION,
             cache,
+            queries: HashMap::new(),
         })
     }
 
@@ -133,6 +172,21 @@ impl MaildirCache {
 
     fn add(&mut self, key: &str) {
         self.cache.insert(key.to_string());
+    }
+
+    /// Get the last_date for a given query, if we've seen it before.
+    fn query_last_date(&self, query: &str) -> Option<&str> {
+        self.queries.get(query).map(|qs| qs.last_date.as_str())
+    }
+
+    /// Update or create the per-query state after a successful fetch.
+    fn update_query(&mut self, query: &str, last_date: &str) {
+        self.queries.insert(
+            query.to_string(),
+            QueryState {
+                last_date: last_date.to_string(),
+            },
+        );
     }
 
     /// Atomically write the cache back to disk (write to .tmp, then rename).
@@ -244,6 +298,144 @@ fn parse_mbox(mbox_content: &str) -> Vec<String> {
     messages
 }
 
+// ── Date parsing for incremental queries ──────────────────────────────
+
+/// Parse common RFC 2822 Date: header formats and produce a `YYYY-MM-DD`
+/// string for Xapian `dt:` range construction.
+///
+/// Handles:
+///   "Fri, 06 Jun 2025 14:32:00 +0000"
+///   "06 Jun 2025 14:32:00 +0000"
+///
+/// Also handles some variants without timezone or with different spacing.
+fn parse_date_string(s: &str) -> Option<String> {
+    const MONTHS: &[(&str, u8)] = &[
+        ("Jan", 1),  ("Feb", 2),  ("Mar", 3),  ("Apr", 4),
+        ("May", 5),  ("Jun", 6),  ("Jul", 7),  ("Aug", 8),
+        ("Sep", 9),  ("Oct", 10), ("Nov", 11), ("Dec", 12),
+    ];
+
+    let parts: Vec<&str> = s.split_whitespace().collect();
+
+    let mut day: Option<u32> = None;
+    let mut month: Option<u8> = None;
+    let mut year: Option<u32> = None;
+
+    for part in &parts {
+        // Try day (1-31, possibly with trailing comma)
+        let trimmed = part.trim_end_matches(',');
+        if let Ok(d) = trimmed.parse::<u32>() {
+            if d >= 1 && d <= 31 {
+                if day.is_none() {
+                    day = Some(d);
+                } else if year.is_none() && d >= 1990 {
+                    year = Some(d);
+                }
+                continue;
+            }
+            // Year (4 digits)
+            if d >= 1990 && d <= 2099 {
+                year = Some(d);
+                continue;
+            }
+        }
+
+        // Try month name
+        for (name, num) in MONTHS {
+            if part.eq_ignore_ascii_case(name) {
+                month = Some(*num);
+                break;
+            }
+        }
+    }
+
+    match (year, month, day) {
+        (Some(y), Some(m), Some(d)) => Some(format!("{:04}-{:02}-{:02}", y, m, d)),
+        _ => None,
+    }
+}
+
+/// Compute the incremental query for a given base query and last_date.
+///
+/// If we have a `last_date` for this query, we inject a `dt:` range:
+/// `dt:YYYYMMDD..` with a 1-day overlap for safety.
+///
+/// If the query already contains `dt:`, we update the lower bound.
+fn build_incremental_query(query: &str, last_date: &str) -> String {
+    // last_date is "YYYY-MM-DD" → extract YYYY, MM, DD
+    let ymd: Vec<&str> = last_date.split('-').collect();
+    if ymd.len() != 3 {
+        return query.to_string();
+    }
+    let year: i32 = match ymd[0].parse() {
+        Ok(y) => y,
+        Err(_) => return query.to_string(),
+    };
+    let month: i32 = match ymd[1].parse() {
+        Ok(m) => m,
+        Err(_) => return query.to_string(),
+    };
+    let day: i32 = match ymd[2].parse() {
+        Ok(d) => d,
+        Err(_) => return query.to_string(),
+    };
+    if year == 0 || month == 0 || day == 0 {
+        return query.to_string();
+    }
+
+    // Subtract 1 day for overlap
+    let (y, m, d) = subtract_one_day(year, month, day);
+    let dt_lower = format!("{:04}{:02}{:02}", y, m, d);
+
+    // Check if the query already has dt:
+    if let Some(dt_start) = query.find("dt:") {
+        // Find the end of the dt: clause (next space or end of string)
+        let after_dt = &query[dt_start..];
+        let dt_end = after_dt
+            .find(' ')
+            .map(|i| dt_start + i)
+            .unwrap_or(query.len());
+
+        let dt_clause = &query[dt_start..dt_end];
+        if let Some(dotdot) = dt_clause.find("..") {
+            // dt:XXX..YYY or dt:XXX.. → replace lower bound
+            let new_dt = format!("dt:{}{}", dt_lower, &dt_clause[dotdot..]);
+            format!("{}{}{}", &query[..dt_start], new_dt, &query[dt_end..])
+        } else {
+            // dt:XXX without .. — unusual, convert to range
+            let new_dt = format!("dt:{}..", dt_lower);
+            format!("{}{}{}", &query[..dt_start], new_dt, &query[dt_end..])
+        }
+    } else {
+        // No dt: in query, append one
+        format!("{} dt:{}..", query.trim_end(), dt_lower)
+    }
+}
+
+/// Subtract one day from a (year, month, day) tuple.
+fn subtract_one_day(year: i32, month: i32, day: i32) -> (i32, i32, i32) {
+    const DAYS_IN_MONTH: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    if day > 1 {
+        (year, month, day - 1)
+    } else if month > 1 {
+        let prev_month = month - 1;
+        let days_in_prev = if prev_month == 2 && is_leap_year(year) {
+            29
+        } else {
+            DAYS_IN_MONTH[(prev_month - 1) as usize]
+        };
+        (year, prev_month, days_in_prev)
+    } else {
+        // January 1 → December 31 of previous year
+        (year - 1, 12, 31)
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
 // ── Maildir helpers ──────────────────────────────────────────────────
 
 /// Check that `path` contains `cur/`, `new/`, `tmp/`.
@@ -311,12 +503,20 @@ impl LoreClient {
         self
     }
 
-    /// Fetch the mbox for a Xapian query, solving Anubis challenges
-    /// if needed.  Returns the raw mbox text.
+    /// Build a ureq agent with a read-stall timeout.
+    /// `timeout_recv_body` triggers if no data arrives for the given duration.
+    fn build_agent(&self) -> ureq::Agent {
+        use ureq::config::Config;
+        Config::builder()
+            .timeout_recv_body(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
+            .build()
+            .into()
+    }
+
+    /// Fetch the mbox for a Xapian query, solving Anubis challenges if needed.
+    /// Returns the raw mbox text (decompressed if gzipped).
     pub fn fetch_mbox(&self, query: &str, list: Option<&str>) -> Result<String, LoreError> {
-        // ureq v3: agent() returns an Agent with cookie support enabled by default.
-        // Timeout is configured via .config().timeout_read().build_agent().
-        let agent = ureq::agent();
+        let agent = self.build_agent();
 
         // Build search URL
         let base_search = match list {
@@ -333,15 +533,14 @@ impl LoreClient {
         }
 
         // Try the initial POST request
-        let body = self.post_mbox(&agent, &search_url, &self.base_url, list)?;
+        let body = self.post_mbox(&agent, &search_url, &self.base_url)?;
 
         // Check if response is an Anubis challenge
         if body.contains("anubis_challenge") || body.contains("Making sure you&#39;re not a bot") {
             if self.verbose {
                 eprintln!("[lorefetch] Detected Anubis bot protection, solving challenge...");
             }
-
-            Ok(self.solve_anubis_and_retry(&agent, &body, &search_url, list)?)
+            self.solve_anubis_and_retry(&agent, &body, &search_url)
         } else {
             Ok(body)
         }
@@ -352,10 +551,7 @@ impl LoreClient {
         agent: &ureq::Agent,
         search_url: &str,
         base_url: &str,
-        list: Option<&str>,
     ) -> Result<String, LoreError> {
-        let _list = list; // used only for search_url construction
-
         let response = agent
             .post(search_url)
             .header("User-Agent", USER_AGENT)
@@ -395,10 +591,15 @@ impl LoreClient {
             .with_config()
             .limit(300 * 1024 * 1024)
             .read_to_vec()
-            .map_err(|e| LoreError::Http(format!("reading response: {}", e)))?;
+            .map_err(|e| {
+                // ureq v3: timeouts come as Error::Timeout, IO errors as Error::Io
+                match &e {
+                    ureq::Error::Timeout(_) => LoreError::ReadTimeout(READ_TIMEOUT_SECS),
+                    _ => LoreError::Http(format!("reading response: {}", e)),
+                }
+            })?;
 
-        // lore.kernel.org sends mbox as application/gzip (not Content-Encoding).
-        // If the content starts with gzip magic bytes, decompress it.
+        // gzip detection: lore.kernel.org sends Content-Type: application/gzip
         let body = if bytes.len() > 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
             if self.verbose {
                 eprintln!("[lorefetch] Detected gzipped content, decompressing...");
@@ -428,7 +629,6 @@ impl LoreClient {
         agent: &ureq::Agent,
         body: &str,
         search_url: &str,
-        list: Option<&str>,
     ) -> Result<String, LoreError> {
         let challenge = detect_anubis(body).ok_or_else(|| {
             LoreError::Anubis("could not extract Anubis challenge data".to_string())
@@ -481,7 +681,7 @@ impl LoreClient {
         }
 
         // Retry the original POST — the cookie jar now has the auth cookie
-        let body = self.post_mbox(agent, search_url, &self.base_url, list)?;
+        let body = self.post_mbox(agent, search_url, &self.base_url)?;
 
         // Validate
         if !body.contains("From ") {
@@ -492,7 +692,7 @@ impl LoreClient {
     }
 }
 
-// ── Minimal URL-encoding (avoid pulling in a crate) ──────────────────
+// ── Minimal URL-encoding ─────────────────────────────────────────────
 
 fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -516,19 +716,22 @@ fn urlencoding(s: &str) -> String {
 ///
 /// This is the primary entry point.  It:
 ///   1. Creates or validates the maildir structure
-///   2. Loads or initialises the cache
-///   3. Fetches the mbox content (solving Anubis if needed)
-///   4. Parses the mbox into individual messages
-///   5. Writes each new message to `new/`, skipping cached ones
-///   6. Saves the updated cache
+///   2. Loads or initialises the cache (including per-query `last_date`)
+///   3. Computes the incremental query (injecting `dt:` if we have a
+///      `last_date` for this query)
+///   4. Fetches the mbox content (solving Anubis if needed)
+///   5. Parses the mbox into individual messages
+///   6. Writes each new message to `new/`, skipping cached ones
+///   7. Tracks the newest Date: header for incremental state
+///   8. Saves the updated cache atomically
 ///
-/// Returns the number of new messages written.
+/// Returns a `FetchResult` with counts and timeout status.
 pub fn fetch_to_maildir(
     query: &str,
     list: Option<&str>,
     maildir: &Path,
     verbose: bool,
-) -> Result<usize, LoreError> {
+) -> Result<FetchResult, LoreError> {
     // 1. Maildir structure
     if maildir.exists() {
         validate_maildir(maildir)?;
@@ -539,23 +742,47 @@ pub fn fetch_to_maildir(
     // 2. Cache
     let mut cache = MaildirCache::load_or_init(maildir)?;
 
-    // 3. Fetch mbox
+    // 3. Compute incremental query
+    let effective_query = match cache.query_last_date(query) {
+        Some(last_date) => {
+            if verbose {
+                eprintln!(
+                    "[lorefetch] Incremental fetch: last_date={}, injecting dt: range",
+                    last_date
+                );
+            }
+            build_incremental_query(query, last_date)
+        }
+        None => {
+            if verbose {
+                eprintln!("[lorefetch] Full fetch (no last_date for this query)");
+            }
+            query.to_string()
+        }
+    };
+
+    // 4. Fetch mbox
     let client = LoreClient::new().verbose(verbose);
-    let mbox_content = client.fetch_mbox(query, list)?;
+    let mbox_content = client.fetch_mbox(&effective_query, list)?;
 
     if mbox_content.trim().is_empty() {
-        return Ok(0);
+        return Ok(FetchResult {
+            new_messages: 0,
+            total_messages: 0,
+            timed_out: false,
+        });
     }
 
-    // 4. Parse
+    // 5. Parse
     let messages = parse_mbox(&mbox_content);
     if messages.is_empty() {
         return Err(LoreError::EmptyMbox);
     }
 
-    // 5. Write new messages
+    // 6. Process each message
     let new_dir = maildir.join("new");
     let mut num_saved = 0usize;
+    let mut newest_date: Option<String> = None;
 
     for (i, msg_text) in messages.iter().enumerate() {
         let parsed = mail_parser::MessageParser::default()
@@ -572,6 +799,20 @@ pub fn fetch_to_maildir(
         hasher.update(msg_id.as_bytes());
         let hash = hasher.finalize();
         let filename = format!("{:x}", hash);
+
+        // Track newest Date: for incremental queries
+        if let Some(date_hdr) = parsed.date() {
+            if let Some(xapian_date) = parse_date_string(&date_hdr.to_rfc822()) {
+                match &newest_date {
+                    None => newest_date = Some(xapian_date),
+                    Some(current) => {
+                        if &xapian_date > current {
+                            newest_date = Some(xapian_date);
+                        }
+                    }
+                }
+            }
+        }
 
         if cache.exists(&filename) {
             continue;
@@ -590,10 +831,18 @@ pub fn fetch_to_maildir(
         num_saved += 1;
     }
 
-    // 6. Save cache
+    // 7. Update per-query state and save cache
+    if let Some(ref last_date) = newest_date {
+        cache.update_query(query, last_date);
+    }
     cache.save(maildir)?;
 
-    Ok(num_saved)
+    let total = messages.len();
+    Ok(FetchResult {
+        new_messages: num_saved,
+        total_messages: total,
+        timed_out: false,
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -715,8 +964,6 @@ mod tests {
 
     #[test]
     fn sha1_filename_matches_go() {
-        // Go: sha1.Sum([]byte("<abc@def>")) → fmt.Sprintf("%x", hash)
-        // This is the same as: hex(sha1("<abc@def>"))
         let msg_id = "<abc@def>";
         let mut hasher = Sha1Hasher::new();
         hasher.update(msg_id.as_bytes());
@@ -726,6 +973,93 @@ mod tests {
         assert_eq!(filename.len(), 40);
         // Verify it's all lowercase hex
         assert!(filename.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── Date parsing ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_rfc2822_date() {
+        assert_eq!(
+            parse_date_string("Fri, 06 Jun 2025 14:32:00 +0000"),
+            Some("2025-06-06".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_rfc2822_date_no_day_name() {
+        assert_eq!(
+            parse_date_string("06 Jun 2025 14:32:00 +0000"),
+            Some("2025-06-06".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_different_month() {
+        assert_eq!(
+            parse_date_string("15 Mar 2024 09:00:00 -0500"),
+            Some("2024-03-15".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_date_fails_on_garbage() {
+        assert_eq!(parse_date_string("not a date"), None);
+    }
+
+    // ── Incremental queries ────────────────────────────────────────
+
+    #[test]
+    fn incremental_query_no_last_date() {
+        let query = "s:linux-kernel";
+        let cache = MaildirCache::new();
+        assert_eq!(cache.query_last_date(query), None);
+    }
+
+    #[test]
+    fn incremental_query_with_last_date() {
+        let result = build_incremental_query("s:linux-kernel", "2025-06-08");
+        assert_eq!(result, "s:linux-kernel dt:20250607..");
+    }
+
+    #[test]
+    fn incremental_query_with_existing_dt() {
+        let result = build_incremental_query(
+            "s:linux-kernel dt:20240101..1.month.ago",
+            "2025-03-15",
+        );
+        assert_eq!(result, "s:linux-kernel dt:20250314..1.month.ago");
+    }
+
+    #[test]
+    fn incremental_query_existing_dt_no_range() {
+        let result = build_incremental_query(
+            "s:linux-kernel dt:20240101",
+            "2025-03-15",
+        );
+        assert!(result.contains("dt:20250314.."));
+    }
+
+    // ── Day subtraction ────────────────────────────────────────────
+
+    #[test]
+    fn subtract_one_day_simple() {
+        assert_eq!(subtract_one_day(2025, 6, 8), (2025, 6, 7));
+    }
+
+    #[test]
+    fn subtract_one_day_month_boundary() {
+        assert_eq!(subtract_one_day(2025, 6, 1), (2025, 5, 31));
+    }
+
+    #[test]
+    fn subtract_one_day_year_boundary() {
+        assert_eq!(subtract_one_day(2025, 1, 1), (2024, 12, 31));
+    }
+
+    #[test]
+    fn subtract_one_day_leap_year() {
+        // March 1, 2024 → Feb 29, 2024 (2024 is a leap year)
+        assert_eq!(subtract_one_day(2024, 3, 1), (2024, 2, 29));
     }
 
     // ── Maildir cache ──────────────────────────────────────────────
@@ -769,16 +1103,18 @@ mod tests {
         let mut cache = MaildirCache::new();
         cache.add("file1");
         cache.add("file2");
+        cache.update_query("s:linux-kernel", "2025-06-08");
         cache.save(maildir).unwrap();
 
         let loaded = MaildirCache::load_or_init(maildir).unwrap();
         assert!(loaded.exists("file1"));
         assert!(loaded.exists("file2"));
         assert!(!loaded.exists("file3"));
+        assert_eq!(loaded.query_last_date("s:linux-kernel"), Some("2025-06-08"));
     }
 
     #[test]
-    fn cache_version_mismatch_rebuilds() {
+    fn cache_version_mismatch_deletes_and_rebuilds() {
         let tmp = tempfile::tempdir().unwrap();
         let maildir = tmp.path();
         for subdir in &["cur", "new", "tmp"] {
@@ -789,6 +1125,7 @@ mod tests {
         let bad_cache = MaildirCache {
             version: 999,
             cache: HashSet::new(),
+            queries: HashMap::new(),
         };
         let path = maildir.join(CACHE_FILENAME);
         std::fs::write(&path, serde_json::to_string_pretty(&bad_cache).unwrap()).unwrap();
@@ -799,6 +1136,55 @@ mod tests {
         let loaded = MaildirCache::load_or_init(maildir).unwrap();
         assert!(loaded.exists("existing_file"));
         assert_eq!(loaded.version, CACHE_VERSION);
+        // Old invalid cache file should have been deleted
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cache_per_query_state() {
+        let mut cache = MaildirCache::new();
+        assert_eq!(cache.query_last_date("s:linux-kernel"), None);
+
+        cache.update_query("s:linux-kernel", "2025-06-08");
+        assert_eq!(
+            cache.query_last_date("s:linux-kernel"),
+            Some("2025-06-08")
+        );
+
+        assert_eq!(cache.query_last_date("s:linux-raid"), None);
+
+        cache.update_query("s:linux-raid", "2025-05-01");
+        assert_eq!(cache.query_last_date("s:linux-raid"), Some("2025-05-01"));
+
+        // Original query still has its state
+        assert_eq!(
+            cache.query_last_date("s:linux-kernel"),
+            Some("2025-06-08")
+        );
+    }
+
+    #[test]
+    fn cache_corrupt_or_v1_deletes_and_rebuilds() {
+        // A corrupt or incompatible cache file is deleted and rebuilt
+        let tmp = tempfile::tempdir().unwrap();
+        let maildir = tmp.path();
+        for subdir in &["cur", "new", "tmp"] {
+            std::fs::create_dir_all(maildir.join(subdir)).unwrap();
+        }
+
+        // v1 cache (no queries field) — can't deserialize into v2 struct
+        let v1_cache = r#"{"version":1,"cache":["abc123"]}"#;
+        let path = maildir.join(CACHE_FILENAME);
+        std::fs::write(&path, v1_cache).unwrap();
+        // Put the file in new/ so rebuild picks it up
+        std::fs::write(maildir.join("new/abc123"), "").unwrap();
+
+        let loaded = MaildirCache::load_or_init(maildir).unwrap();
+        assert_eq!(loaded.version, CACHE_VERSION);
+        assert!(loaded.exists("abc123"));
+        assert!(loaded.queries.is_empty());
+        // Old incompatible cache file should have been deleted
+        assert!(!path.exists());
     }
 
     // ── Maildir validation ────────────────────────────────────────

@@ -95,7 +95,12 @@ fn main() {
             &maildir,
             verbose,
         ) {
-            Ok(n) => eprintln!("{n} new messages fetched"),
+            Ok(r) => {
+                if r.timed_out {
+                    eprintln!("Warning: read timeout after {} messages (partial fetch)", r.total_messages);
+                }
+                eprintln!("{} new of {} total messages fetched", r.new_messages, r.total_messages);
+            }
             Err(e) => {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
