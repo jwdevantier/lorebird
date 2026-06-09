@@ -20,6 +20,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libgtksourceview-5-dev
+      - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --workspace
 
@@ -43,6 +44,16 @@ jobs:
             mingw-w64-ucrt-x86_64-ntldd
             zip
 
+      - name: Cache Cargo target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-windows-ucrt64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-windows-ucrt64-
+
       - name: Build
         run: cargo build --release -p loreread
 
@@ -50,7 +61,7 @@ jobs:
         run: |
           mkdir -p dist
           bash scripts/win-ucr64t-bundler.sh target/release/loreread.exe dist/loreread
-          cp icon/org.loreread.app.ico dist/loreread/
+          cp crates/loreread-gtk/resources/org.loreread.app.ico dist/loreread/
 
       - name: Upload artifact (PRs)
         uses: actions/upload-artifact@v4
@@ -63,7 +74,6 @@ jobs:
         run: |
           cd dist/loreread
           zip -r ../../../loreread-${{ github.ref_name }}-windows-x86_64.zip *
-        # zip uploaded by the release step below
 
       - name: Upload release asset
         if: startsWith(github.ref, 'refs/tags/')
