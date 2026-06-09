@@ -14,11 +14,19 @@ use std::rc::Rc;
 use app_state::AppState;
 
 fn main() {
+    // Load compiled-in resources (icons)
+    gio::resources_register_include!("org.loreread.app.gresource")
+        .expect("Failed to register GResource bundle");
+
     let app = Application::builder()
         .application_id("org.loreread.app")
         .build();
 
     app.connect_activate(|app| {
+        // Register our resource path so GTK's icon theme can find our icon
+        gtk4::IconTheme::default()
+            .add_resource_path("/org/loreread/app/icons");
+
         // Look for --config <path> on the command line
         let config_path = std::env::args()
             .collect::<Vec<_>>()

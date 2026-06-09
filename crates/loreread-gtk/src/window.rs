@@ -43,6 +43,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("loreread")
+        .icon_name("org.loreread.app")
         .default_width(1200)
         .default_height(700)
         .build();

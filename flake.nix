@@ -64,6 +64,9 @@
 
             nativeBuildInputs = with pkgs; [
               pkg-config
+              glib
+              wrapGAppsHook4
+              copyDesktopItems
             ];
 
             buildInputs = with pkgs; [
@@ -74,6 +77,26 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
             };
+
+            desktopItems = [
+              (pkgs.makeDesktopItem {
+                name = "org.loreread.app";
+                exec = "loreread";
+                icon = "org.loreread.app";
+                comment = "Lightweight mail reader for lore.kernel.org";
+                desktopName = "loreread";
+                categories = [ "Network" "Email" ];
+              })
+            ];
+
+            postInstall = ''
+              # Install icons into the hicolor icon theme
+              for size in 16 32 48 64 128 256; do
+                mkdir -p $out/share/icons/hicolor/''${size}x''${size}/apps
+                cp icon/org.loreread.app.''${size}.png \
+                  $out/share/icons/hicolor/''${size}x''${size}/apps/org.loreread.app.png
+              done
+            '';
           };
         in
         {

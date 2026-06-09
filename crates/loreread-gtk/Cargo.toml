@@ -7,6 +7,12 @@ edition = "2024"
 name = "loreread"
 path = "src/main.rs"
 
+[build-dependencies]
+glib-build-tools = "0.22"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 [dependencies]
 gtk4 = { version = "0.11", package = "gtk4", features = ["v4_10"] }
 gdk4 = "0.11"
