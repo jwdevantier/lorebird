@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gresources>
   <gresource prefix="/org/loreread/app">
-    <file preprocess="xml-stripblanks">org.loreread.app.16.png</file>
-    <file preprocess="xml-stripblanks">org.loreread.app.32.png</file>
-    <file preprocess="xml-stripblanks">org.loreread.app.48.png</file>
-    <file preprocess="xml-stripblanks">org.loreread.app.64.png</file>
-    <file preprocess="xml-stripblanks">org.loreread.app.128.png</file>
-    <file preprocess="xml-stripblanks">org.loreread.app.256.png</file>
+    <file>org.loreread.app.16.png</file>
+    <file>org.loreread.app.32.png</file>
+    <file>org.loreread.app.48.png</file>
+    <file>org.loreread.app.64.png</file>
+    <file>org.loreread.app.128.png</file>
+    <file>org.loreread.app.256.png</file>
   </gresource>
   <gresource prefix="/org/loreread/app/icons/scalable/apps">
     <file alias="org.loreread.app.png">org.loreread.app.256.png</file>
