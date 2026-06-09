@@ -13,10 +13,10 @@ use gio::ListStore;
 use glib::Object;
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box, ColumnView, ColumnViewColumn, CustomSorter, Grid, HeaderBar, IconSize,
-    Image, Label, ListBoxRow, ListItem, Ordering, Orientation, Paned, PolicyType, SearchEntry,
-    ScrolledWindow, SignalListItemFactory, SingleSelection, SortListModel, Spinner, SortType,
-    TreeExpander, TreeListModel, TreeListRow, WrapMode,
+    Application, ApplicationWindow, Box, ColumnView, ColumnViewColumn, CustomSorter, Grid,
+    HeaderBar, IconSize, Image, Label, ListBoxRow, ListItem, Ordering, Orientation, Paned,
+    PolicyType, ScrolledWindow, SearchEntry, SignalListItemFactory, SingleSelection, SortListModel,
+    SortType, Spinner, TreeExpander, TreeListModel, TreeListRow, WrapMode,
 };
 use sourceview5 as sv;
 use sourceview5::prelude::*;
@@ -166,9 +166,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         let Some(row) = row else { return };
         let idx = row.index() as u32;
         // Retrieve the FolderItem from the sidebar model
-        let item: Option<FolderItem> = model
-            .item(idx)
-            .and_downcast::<FolderItem>();
+        let item: Option<FolderItem> = model.item(idx).and_downcast::<FolderItem>();
         let Some(item) = item else { return };
 
         let profile = item.profile_label();
@@ -204,16 +202,14 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 }
                 if s.db.borrow().is_some() {
                     match s.show_all() {
-                        Ok(()) => status_for_sidebar.set_text(&format!(
-                            "All mail for: {}", profile
-                        )),
+                        Ok(()) => {
+                            status_for_sidebar.set_text(&format!("All mail for: {}", profile))
+                        }
                         Err(e) => status_for_sidebar.set_text(&format!("Error: {}", e)),
                     }
                 } else {
-                    status_for_sidebar.set_text(&format!(
-                        "No index for {} \u{2014} click Refresh",
-                        profile
-                    ));
+                    status_for_sidebar
+                        .set_text(&format!("No index for {} \u{2014} click Refresh", profile));
                 }
                 search_for_sidebar.set_text("");
             }
@@ -228,10 +224,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                     }
                 }
                 if s.db.borrow().is_none() {
-                    status_for_sidebar.set_text(&format!(
-                        "No index for {} \u{2014} click Refresh",
-                        profile
-                    ));
+                    status_for_sidebar
+                        .set_text(&format!("No index for {} \u{2014} click Refresh", profile));
                     return;
                 }
 
@@ -241,7 +235,9 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 match s.search(&query) {
                     Ok(n) => status_for_sidebar.set_text(&format!(
                         "View \u{2018}{}\u{2019} in: {} \u{2014} {} match(es)",
-                        item.name(), profile, n
+                        item.name(),
+                        profile,
+                        n
                     )),
                     Err(e) => status_for_sidebar.set_text(&format!("Search error: {}", e)),
                 }
@@ -328,10 +324,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
             let s = state_for_search.borrow();
             match s.search(&query) {
                 Ok(n) => {
-                    status_for_search.set_text(&format!(
-                        "Found {} matching message(s) in thread(s)",
-                        n
-                    ));
+                    status_for_search
+                        .set_text(&format!("Found {} matching message(s) in thread(s)", n));
                 }
                 Err(e) => {
                     status_for_search.set_text(&format!("Search error: {}", e));
@@ -456,8 +450,7 @@ fn trigger_reply(
     let filename = node.filename();
     let maildir = s.active_maildir.borrow().clone();
     let headers = if !filename.is_empty() {
-        loreread_core::store::read_raw_headers(&maildir, &filename)
-            .unwrap_or_default()
+        loreread_core::store::read_raw_headers(&maildir, &filename).unwrap_or_default()
     } else {
         HashMap::new()
     };
@@ -482,8 +475,7 @@ fn trigger_reply(
     };
 
     // Build pre-filled reply
-    let mail = ComposeMail::new_reply(&parent, &profile.name, &profile.email,
-    );
+    let mail = ComposeMail::new_reply(&parent, &profile.name, &profile.email);
 
     // If on_reply hook exists, dispatch to the Lua thread and poll for result
     if s.has_on_reply {
@@ -512,7 +504,10 @@ fn trigger_reply(
         glib::timeout_add_local(Duration::from_millis(50), move || {
             let s = state_poll.borrow();
             match s.poll_fetch_result() {
-                Some(crate::lua_thread::LuaResult::ReplyDone { mail: modified, error }) => {
+                Some(crate::lua_thread::LuaResult::ReplyDone {
+                    mail: modified,
+                    error,
+                }) => {
                     if let Some(e) = error {
                         status_poll.set_text(&format!("on_reply error: {}", e));
                         // Still open compose with default mail
@@ -583,16 +578,14 @@ fn build_sidebar(state: &AppState) -> (ScrolledWindow, ListStore, gtk4::ListBox)
 
     // If no profiles, show a helpful placeholder
     if profile_labels.is_empty() {
-        sidebar_model.append(&FolderItem::placeholder(
-            &format!(
-                "No profiles configured.\n\n\
+        sidebar_model.append(&FolderItem::placeholder(&format!(
+            "No profiles configured.\n\n\
                  Create {}\n\
                  or start with --config <path>",
-                loreread_core::config_dir::loreread_conf_path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<config dir>/loreread/config.lua".to_string()),
-            ),
-        ));
+            loreread_core::config_dir::loreread_conf_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<config dir>/loreread/config.lua".to_string()),
+        )));
     }
 
     let list_box = gtk4::ListBox::new();
@@ -600,14 +593,11 @@ fn build_sidebar(state: &AppState) -> (ScrolledWindow, ListStore, gtk4::ListBox)
     list_box.add_css_class("navigation-sidebar");
 
     // Bind model → ListBox rows
-    list_box.bind_model(
-        Some(&sidebar_model),
-        |item: &Object| -> gtk4::Widget {
-            let folder_item = item.downcast_ref::<FolderItem>().unwrap();
-            let row = make_sidebar_row(folder_item);
-            row.upcast::<gtk4::Widget>()
-        },
-    );
+    list_box.bind_model(Some(&sidebar_model), |item: &Object| -> gtk4::Widget {
+        let folder_item = item.downcast_ref::<FolderItem>().unwrap();
+        let row = make_sidebar_row(folder_item);
+        row.upcast::<gtk4::Widget>()
+    });
 
     scrolled.set_child(Some(&list_box));
     (scrolled, sidebar_model, list_box)
@@ -697,7 +687,10 @@ pub(crate) struct PreviewLabels {
 
 /// Build the centre pane, returning the root widget, the selection model
 /// (for wiring to the preview), and the preview labels.
-fn build_center_pane(root_model: &ListStore, is_dark: bool) -> (Box, SingleSelection, ColumnView, PreviewLabels, SearchEntry) {
+fn build_center_pane(
+    root_model: &ListStore,
+    is_dark: bool,
+) -> (Box, SingleSelection, ColumnView, PreviewLabels, SearchEntry) {
     let vbox = Box::new(Orientation::Vertical, 0);
 
     // ── Search bar ────────────────────────────────────────────
@@ -739,7 +732,8 @@ fn build_center_pane(root_model: &ListStore, is_dark: bool) -> (Box, SingleSelec
     let style_mgr = sv::StyleSchemeManager::default();
     let scheme_name = if is_dark { "Adwaita-dark" } else { "kate" };
     let fallback_name = if is_dark { "oblivion" } else { "Adwaita" };
-    if let Some(scheme) = style_mgr.scheme(scheme_name)
+    if let Some(scheme) = style_mgr
+        .scheme(scheme_name)
         .or_else(|| style_mgr.scheme(fallback_name))
     {
         body_buffer.set_style_scheme(Some(&scheme));
@@ -789,14 +783,8 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
     });
     subject_factory.connect_bind(|_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
-        let row = list_item
-            .item()
-            .and_downcast::<TreeListRow>()
-            .unwrap();
-        let expander = list_item
-            .child()
-            .and_downcast::<TreeExpander>()
-            .unwrap();
+        let row = list_item.item().and_downcast::<TreeListRow>().unwrap();
+        let expander = list_item.child().and_downcast::<TreeExpander>().unwrap();
         expander.set_list_row(Some(&row));
         if let Some(node) = row.item().and_downcast::<ThreadNode>()
             && let Some(label) = expander.child().and_downcast::<Label>()
@@ -805,8 +793,7 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
         }
     });
 
-    let subject_col =
-        ColumnViewColumn::new(Some("Subject"), Some(subject_factory));
+    let subject_col = ColumnViewColumn::new(Some("Subject"), Some(subject_factory));
     subject_col.set_expand(true);
     column_view.append_column(&subject_col);
 
@@ -823,10 +810,7 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
     });
     from_factory.connect_bind(|_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
-        let row = list_item
-            .item()
-            .and_downcast::<TreeListRow>()
-            .unwrap();
+        let row = list_item.item().and_downcast::<TreeListRow>().unwrap();
         if let Some(node) = row.item().and_downcast::<ThreadNode>()
             && let Some(label) = list_item.child().and_downcast::<Label>()
         {
@@ -850,10 +834,7 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
     });
     started_factory.connect_bind(|_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
-        let row = list_item
-            .item()
-            .and_downcast::<TreeListRow>()
-            .unwrap();
+        let row = list_item.item().and_downcast::<TreeListRow>().unwrap();
         if let Some(node) = row.item().and_downcast::<ThreadNode>()
             && let Some(label) = list_item.child().and_downcast::<Label>()
         {
@@ -873,8 +854,7 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
         }
     });
 
-    let started_col =
-        ColumnViewColumn::new(Some("Started"), Some(started_factory));
+    let started_col = ColumnViewColumn::new(Some("Started"), Some(started_factory));
     started_col.set_sorter(Some(&started_sorter));
     started_col.set_resizable(false);
     column_view.append_column(&started_col);
@@ -892,10 +872,7 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
     });
     last_reply_factory.connect_bind(|_, obj| {
         let list_item = obj.downcast_ref::<ListItem>().unwrap();
-        let row = list_item
-            .item()
-            .and_downcast::<TreeListRow>()
-            .unwrap();
+        let row = list_item.item().and_downcast::<TreeListRow>().unwrap();
         if let Some(node) = row.item().and_downcast::<ThreadNode>()
             && let Some(label) = list_item.child().and_downcast::<Label>()
         {
@@ -914,8 +891,7 @@ fn build_thread_list(root_model: &ListStore) -> (ColumnView, SingleSelection) {
         }
     });
 
-    let last_reply_col =
-        ColumnViewColumn::new(Some("Last Reply"), Some(last_reply_factory));
+    let last_reply_col = ColumnViewColumn::new(Some("Last Reply"), Some(last_reply_factory));
     last_reply_col.set_sorter(Some(&last_reply_sorter));
     last_reply_col.set_resizable(false);
     column_view.append_column(&last_reply_col);
@@ -1023,106 +999,6 @@ fn build_preview_pane(labels: &PreviewLabels) -> Box {
     vbox
 }
 
-/// Create a dim, right-aligned header key label (e.g. "From:").
-/// Detect the source language from message content.
-///
-/// Email bodies often have prose before the code/diff, so we scan
-/// the full content rather than just the first few lines.
-/// Does this line look like the start of a diff section?
-/// Does this line look like the start of a unified diff header?
-/// Does this line mark the start of a diff region?
-///
-/// Recognises unified-diff headers and the standalone `---` separator
-/// that precedes the diff stats block in patch emails.
-fn is_diff_region_start(line: &str) -> bool {
-    let trimmed = line.trim_end();
-    trimmed.starts_with("diff --git")
-        || trimmed.starts_with("diff -r")
-        || trimmed == "---"
-}
-
-/// Does this line mark the start of a mail signature?
-///
-/// The standard signature separator is `-- ` (two dashes + space),
-/// per RFC 3676.  We also match bare `--` as a fallback.
-fn is_signature_separator(line: &str) -> bool {
-    line == "-- " || line == "--"
-}
-
-/// Find character ranges of "prose" sections in a mail body.
-///
-/// The approach is region-based rather than line-by-line:
-///
-///   1. Scan for the first diff-starting line (`diff --git` or
-///      standalone `---`).  Everything before it is prose.
-///   2. Everything from that first diff start to the signature
-///      separator (`-- `) or message end is a **diff region** —
-///      the SourceView diff language handles syntax highlighting
-///      inside it automatically.  We don't need to classify
-///      individual lines as "is this diff content?".
-///   3. Anything after the signature separator is also prose.
-///
-/// Returns (start_char, end_char) pairs for prose sections,
-/// suitable for passing to `gtk_text_buffer_apply_tag()`
-/// via `iter_at_offset()`.
-fn find_prose_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() {
-        return ranges;
-    }
-
-    // Track *character* offsets for each line start.
-    // `iter_at_offset` expects character positions, not bytes.
-    let mut line_char_starts: Vec<usize> = Vec::with_capacity(lines.len() + 1);
-    let mut pos = 0usize;
-    for line in &lines {
-        line_char_starts.push(pos);
-        pos += line.chars().count() + 1; // +1 for '\n'
-    }
-    line_char_starts.push(pos); // past-the-end sentinel
-
-    // Total characters in the buffer (including newlines)
-    let total_chars: usize = text.chars().count();
-
-    // Find first diff-region start
-    let first_diff = lines.iter().position(|l| is_diff_region_start(l));
-
-    // Find signature separator (if any)
-    let sig_pos = lines.iter().position(|l| is_signature_separator(l));
-
-    match first_diff {
-        None => {
-            // No diffs at all — entire message is prose (minus signature)
-            let end = sig_pos
-                .map(|i| line_char_starts[i])
-                .unwrap_or(total_chars);
-            if end > 0 {
-                ranges.push((0, end));
-            }
-        }
-        Some(fdi) => {
-            // Prose before first diff region
-            if fdi > 0 {
-                ranges.push((0, line_char_starts[fdi]));
-            }
-
-            // Trailing prose: anything after the signature separator.
-            // The diff region extends from fdi to the signature (or EOF).
-            // If there's a signature, the text after it is prose.
-            if let Some(si) = sig_pos {
-                // Signature line itself goes with the prose
-                let start = line_char_starts[si];
-                if start < total_chars {
-                    ranges.push((start, total_chars));
-                }
-            }
-        }
-    }
-
-    ranges
-}
-
 /// Render message body with diff highlighting and prose tagging.
 ///
 /// Always sets the SourceView language to "diff" so that diff syntax
@@ -1154,7 +1030,6 @@ fn truncate_addr(s: &str) -> String {
         format!("{}…", &s[..cut])
     }
 }
-
 
 #[cfg(test)]
 mod tests {
