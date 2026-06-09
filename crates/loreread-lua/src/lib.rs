@@ -7,7 +7,10 @@
 
 mod config;
 
-pub use config::{AppConfig, GlobalHooks, LoadedConfig, ProfileData, ProfileHooks, ResolvedProfile, UserInfo, ViewConfig};
+pub use config::{
+    AppConfig, GlobalHooks, LoadedConfig, ProfileData, ProfileHooks, ResolvedProfile, UserInfo,
+    ViewConfig,
+};
 pub use loreread_core::compose::{ComposeMail, ParentMail};
 pub use loreread_sendmail::{SendError, SmtpConfig};
 
@@ -15,8 +18,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use mlua::{DeserializeOptions, IntoLua};
+use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 
 /// Temp-file counter for unique filenames.
 static TMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -38,7 +41,10 @@ impl Vm {
     /// - `read_file(path)` — read a file's contents as a string
     pub fn new() -> LuaResult<Self> {
         let lua = Lua::new();
-        let vm = Self { lua, temp_files: std::cell::RefCell::new(Vec::new()) };
+        let vm = Self {
+            lua,
+            temp_files: std::cell::RefCell::new(Vec::new()),
+        };
         vm.register_helpers()?;
         Ok(vm)
     }
@@ -96,10 +102,7 @@ impl Vm {
         // ── read_file(path) → string ────────────────────────────
         let read_file_fn = self.lua.create_function(|_, path: String| {
             std::fs::read_to_string(&path).map_err(|e| {
-                mlua::Error::external(format!(
-                    "read_file: cannot read '{}': {}",
-                    path, e
-                ))
+                mlua::Error::external(format!("read_file: cannot read '{}': {}", path, e))
             })
         })?;
 
@@ -113,9 +116,8 @@ impl Vm {
             let pid = std::process::id();
             let name = format!("loreread_{}_{}", pid, count);
             let path = std::env::temp_dir().join(name);
-            std::fs::write(&path, &content).map_err(|e| {
-                mlua::Error::external(format!("write_tmpfile: {}", e))
-            })?;
+            std::fs::write(&path, &content)
+                .map_err(|e| mlua::Error::external(format!("write_tmpfile: {}", e)))?;
             Ok(path.to_string_lossy().to_string())
         })?;
 
@@ -129,35 +131,39 @@ impl Vm {
             Ok(mail.to_rfc2822())
         })?;
 
-        self.lua.globals().set("mail_to_rfc2822", mail_to_rfc2822_fn)?;
+        self.lua
+            .globals()
+            .set("mail_to_rfc2822", mail_to_rfc2822_fn)?;
 
         // ── lorefetch(maildir, query) → { ok, count?, error? } ──────
         //   Fetch mail from lore.kernel.org into a maildir.
-        let lorefetch_fn = self.lua.create_function(|lua, (maildir, query): (String, String)| {
-            let result = loreread_lorefetch::fetch_to_maildir(
-                &query,
-                None, // search /all/ by default
-                std::path::Path::new(&maildir),
-                false, // verbose off by default from Lua
-            );
+        let lorefetch_fn =
+            self.lua
+                .create_function(|lua, (maildir, query): (String, String)| {
+                    let result = loreread_lorefetch::fetch_to_maildir(
+                        &query,
+                        None, // search /all/ by default
+                        std::path::Path::new(&maildir),
+                        false, // verbose off by default from Lua
+                    );
 
-            let table = lua.create_table()?;
-            match result {
-                Ok(r) => {
-                    table.set("ok", true)?;
-                    table.set("count", r.total_messages)?;
-                    table.set("new", r.new_messages)?;
-                    if r.timed_out {
-                        table.set("timed_out", true)?;
+                    let table = lua.create_table()?;
+                    match result {
+                        Ok(r) => {
+                            table.set("ok", true)?;
+                            table.set("count", r.total_messages)?;
+                            table.set("new", r.new_messages)?;
+                            if r.timed_out {
+                                table.set("timed_out", true)?;
+                            }
+                        }
+                        Err(e) => {
+                            table.set("ok", false)?;
+                            table.set("error", e.to_string())?;
+                        }
                     }
-                }
-                Err(e) => {
-                    table.set("ok", false)?;
-                    table.set("error", e.to_string())?;
-                }
-            }
-            Ok(table)
-        })?;
+                    Ok(table)
+                })?;
 
         self.lua.globals().set("lorefetch", lorefetch_fn)?;
 
@@ -175,32 +181,59 @@ impl Vm {
                 mlua::Value::Table(t) => {
                     // Deserialize the smtp table from Lua
                     let options = DeserializeOptions::new().deny_unsupported_types(false);
-                    let smtp_config: loreread_sendmail::SmtpConfig =
-                        lua.from_value_with(t.into_lua(lua)?, options)
-                            .map_err(|e| mlua::Error::external(format!("invalid smtp config: {}", e)))?;
+                    let smtp_config: loreread_sendmail::SmtpConfig = lua
+                        .from_value_with(t.into_lua(lua)?, options)
+                        .map_err(|e| {
+                            mlua::Error::external(format!("invalid smtp config: {}", e))
+                        })?;
 
                     // Build envelope from the mail headers
                     let parsed = mail_parser::MessageParser::default()
                         .parse(rfc2822.as_bytes())
-                        .ok_or_else(|| mlua::Error::external("send_smtp: failed to parse RFC 2822 message"))?;
+                        .ok_or_else(|| {
+                            mlua::Error::external("send_smtp: failed to parse RFC 2822 message")
+                        })?;
 
-                    let from_addr = parsed.from()
+                    let from_addr = parsed
+                        .from()
                         .and_then(|f| f.first())
                         .and_then(|m| m.address())
                         .map(|a| a.to_string())
                         .unwrap_or_default();
 
-                    let to_addrs: Vec<String> = parsed.to()
-                        .map(|addrs| addrs.iter().filter_map(|a| a.address()).map(|a| a.to_string()).collect())
+                    let to_addrs: Vec<String> = parsed
+                        .to()
+                        .map(|addrs| {
+                            addrs
+                                .iter()
+                                .filter_map(|a| a.address())
+                                .map(|a| a.to_string())
+                                .collect()
+                        })
                         .unwrap_or_default();
-                    let cc_addrs: Vec<String> = parsed.cc()
-                        .map(|addrs| addrs.iter().filter_map(|a| a.address()).map(|a| a.to_string()).collect())
+                    let cc_addrs: Vec<String> = parsed
+                        .cc()
+                        .map(|addrs| {
+                            addrs
+                                .iter()
+                                .filter_map(|a| a.address())
+                                .map(|a| a.to_string())
+                                .collect()
+                        })
                         .unwrap_or_default();
-                    let bcc_addrs: Vec<String> = parsed.bcc()
-                        .map(|addrs| addrs.iter().filter_map(|a| a.address()).map(|a| a.to_string()).collect())
+                    let bcc_addrs: Vec<String> = parsed
+                        .bcc()
+                        .map(|addrs| {
+                            addrs
+                                .iter()
+                                .filter_map(|a| a.address())
+                                .map(|a| a.to_string())
+                                .collect()
+                        })
                         .unwrap_or_default();
 
-                    let all_recipients: Vec<&str> = to_addrs.iter()
+                    let all_recipients: Vec<&str> = to_addrs
+                        .iter()
                         .chain(cc_addrs.iter())
                         .chain(bcc_addrs.iter())
                         .map(|s| s.as_str())
@@ -292,19 +325,18 @@ impl Vm {
                     self.lua.load(code).exec()?;
                     self.lua.globals().get("config").map_err(|_| {
                         mlua::Error::external(
-                            "Config file must either return a table or set a "
-                                .to_string()
-                            + "global 'config' table.\n"
-                            + "\n"
-                            + "Modern style (return a table):\n"
-                            + "  return {\n"
-                            + "    profiles = { ... },\n"
-                            + "  }\n"
-                            + "\n"
-                            + "Legacy style (set global):\n"
-                            + "  config = {\n"
-                            + "    profiles = { ... },\n"
-                            + "  }"
+                            "Config file must either return a table or set a ".to_string()
+                                + "global 'config' table.\n"
+                                + "\n"
+                                + "Modern style (return a table):\n"
+                                + "  return {\n"
+                                + "    profiles = { ... },\n"
+                                + "  }\n"
+                                + "\n"
+                                + "Legacy style (set global):\n"
+                                + "  config = {\n"
+                                + "    profiles = { ... },\n"
+                                + "  }",
                         )
                     })?
                 }
@@ -359,10 +391,7 @@ impl Vm {
         hooks: &ProfileHooks,
     ) -> LuaResult<bool> {
         let func = hooks.on_fetch.as_ref().ok_or_else(|| {
-            mlua::Error::external(format!(
-                "profile '{}' has no on_fetch hook",
-                profile_label
-            ))
+            mlua::Error::external(format!("profile '{}' has no on_fetch hook", profile_label))
         })?;
 
         // Lua truthiness: nil/false → false, everything else → true
@@ -513,30 +542,6 @@ fn build_mail_table(lua: &Lua, mail: &ComposeMail) -> LuaResult<Table> {
     table.set("headers", headers)?;
 
     Ok(table)
-}
-
-/// Extract a bare email address from a header value like
-/// `"Alice \u003calice@example.com\u003e"` or `"alice@example.com"`.
-fn extract_email_address(header: &str) -> String {
-    // If the string contains angle brackets, extract the content
-    if let Some(start) = header.rfind('<') {
-        if let Some(end) = header[start..].find('>') {
-            return header[start + 1..start + end].to_string();
-        }
-    }
-    // Otherwise use the whole string, stripped of whitespace
-    header.trim().to_string()
-}
-
-/// Split a comma-separated address list into individual addresses.
-fn split_addresses(header: &str) -> Vec<String> {
-    if header.trim().is_empty() {
-        return Vec::new();
-    }
-    header.split(',')
-        .map(|s| extract_email_address(s.trim()))
-        .filter(|s| !s.is_empty())
-        .collect()
 }
 
 /// Extract a `ComposeMail` from a Lua table.
@@ -748,10 +753,7 @@ config = {
             .eval()
             .unwrap();
         assert_eq!(result.get::<bool>("ok").unwrap(), false);
-        assert_eq!(
-            result.get::<Option<i64>>("exit_code").unwrap(),
-            Some(42)
-        );
+        assert_eq!(result.get::<Option<i64>>("exit_code").unwrap(), Some(42));
     }
 
     #[test]
@@ -771,10 +773,7 @@ config = {
         let vm = Vm::new().unwrap();
         let tmp = std::env::temp_dir().join("loreread_test_read_file.txt");
         std::fs::write(&tmp, "hello from file").unwrap();
-        let code = format!(
-            r#"return read_file("{}")"#,
-            tmp.display()
-        );
+        let code = format!(r#"return read_file("{}")"#, tmp.display());
         let content: String = vm.lua.load(&code).eval().unwrap();
         assert_eq!(content, "hello from file");
         std::fs::remove_file(&tmp).ok();
@@ -814,8 +813,12 @@ config = {
     fn write_tmpfile_helper() {
         let vm = Vm::new().unwrap();
         let content = "Hello, tmpfile!";
-        let path: String = vm.lua
-            .load(&format!(r#"return write_tmpfile("{}")"#, content.replace('\n', "\\n")))
+        let path: String = vm
+            .lua
+            .load(&format!(
+                r#"return write_tmpfile("{}")"#,
+                content.replace('\n', "\\n")
+            ))
             .eval()
             .unwrap();
         assert!(!path.is_empty());
@@ -827,8 +830,10 @@ config = {
     #[test]
     fn mail_to_rfc2822_helper() {
         let vm = Vm::new().unwrap();
-        let result: String = vm.lua
-            .load(r#"
+        let result: String = vm
+            .lua
+            .load(
+                r#"
 local mail = {
   from = "Alice <alice@example.com>",
   to = "Bob <bob@example.com>",
@@ -841,7 +846,8 @@ local mail = {
   headers = { ["X-Mailer"] = "loreread" },
 }
 return mail_to_rfc2822(mail)
-"#)
+"#,
+            )
             .eval()
             .unwrap();
         assert!(result.contains("From: Alice <alice@example.com>"));
@@ -891,12 +897,17 @@ config = {
             headers: std::collections::HashMap::new(),
         };
         let mail = loreread_core::compose::ComposeMail::new_reply(
-            &parent, "Riccardo", "riccardo@defmacro.it",
+            &parent,
+            "Riccardo",
+            "riccardo@defmacro.it",
         );
 
         let result = vm.call_on_reply(on_reply, "test", &parent, &mail).unwrap();
         assert_eq!(result.cc, "added-by-hook@example.com");
-        assert_eq!(result.to, "list@example.com, Riccardo <riccardo@defmacro.it>"); // unchanged by hook
+        assert_eq!(
+            result.to,
+            "list@example.com, Riccardo <riccardo@defmacro.it>"
+        ); // unchanged by hook
     }
 
     #[test]
@@ -931,9 +942,8 @@ config = {
             body_text: String::new(),
             headers: std::collections::HashMap::new(),
         };
-        let mail = loreread_core::compose::ComposeMail::new_reply(
-            &parent, "Bob", "bob@example.com",
-        );
+        let mail =
+            loreread_core::compose::ComposeMail::new_reply(&parent, "Bob", "bob@example.com");
 
         // The hook modifies mail.cc in-place; we always get back the
         // (potentially modified) mail, never None.
@@ -947,7 +957,8 @@ config = {
         // Use a write_tmpfile-based on_send that we can verify
         let tmp = std::env::temp_dir().join("loreread_test_on_send.txt");
         let tmp_path = tmp.display().to_string();
-        let code = format!(r#"
+        let code = format!(
+            r#"
 config = {{
   profiles = {{
     ["test"] = {{
@@ -961,7 +972,9 @@ config = {{
     sh({{"cp", fpath, "{}"}})
   end,
 }}
-"#, tmp_path);
+"#,
+            tmp_path
+        );
         let loaded = vm.load_config_string(&code).unwrap();
         let on_send = loaded.global_hooks.on_send.as_ref().unwrap();
 
@@ -1115,7 +1128,10 @@ config = {
         let resolved = loaded.config.resolve_all();
         let smtp = resolved["work"].smtp.as_ref().unwrap();
         assert_eq!(smtp.password, "eval:false"); // prefix preserved
-        assert!(smtp.resolved_password().is_err(), "eval:false should fail at send time");
+        assert!(
+            smtp.resolved_password().is_err(),
+            "eval:false should fail at send time"
+        );
     }
 
     #[test]
@@ -1129,18 +1145,5 @@ config = {
         let err: String = result.get("error").unwrap();
         assert!(err.contains("no smtp config"));
     }
-
-    #[test]
-    fn extract_email_address_works() {
-        assert_eq!(super::extract_email_address(r#"Alice <alice@example.com>"#), "alice@example.com");
-        assert_eq!(super::extract_email_address("bob@example.com"), "bob@example.com");
-        assert_eq!(super::extract_email_address(r#"  <c@c.com>  "#), "c@c.com");
-    }
-
-    #[test]
-    fn split_addresses_works() {
-        let addrs = super::split_addresses(r#"Alice <a@x.com>, Bob <b@y.com>"#);
-        assert_eq!(addrs, vec!["a@x.com", "b@y.com"]);
-        assert!(super::split_addresses("").is_empty());
-    }
 }
+
