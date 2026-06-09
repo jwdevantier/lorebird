@@ -249,7 +249,9 @@ impl<R: Read> MboxParser<R> {
                 return Ok(Some((idx, msg)));
             }
 
-            if !self.msg_buf.is_empty() { self.msg_buf.push(b'\n'); }
+            // Accumulate this line into the current message buffer
+            // (read_line includes the trailing \n, so lines are
+            // already separated)
             self.msg_buf.extend_from_slice(&self.line_buf);
         }
     }
