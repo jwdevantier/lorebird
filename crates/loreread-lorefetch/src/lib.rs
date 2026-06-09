@@ -23,6 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
