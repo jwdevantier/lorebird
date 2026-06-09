@@ -175,10 +175,10 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
 
         let profile = send_profile.clone();
 
-        // Check for on_send hook
+        // on_send hook is required for sending
         let s = send_state.borrow();
         if !s.has_on_send {
-            send_status.set_text("Cannot send: no on_send hook configured");
+            send_status.set_text("Cannot send: on_send hook not defined");
             send_status.remove_css_class("dim-label");
             send_status.add_css_class("error");
             return;

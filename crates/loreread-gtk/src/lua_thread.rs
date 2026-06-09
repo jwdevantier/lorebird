@@ -384,57 +384,40 @@ fn handle_reply(
 
 /// Handle a Send command: call on_send hook.
 ///
-/// The on_send hook is responsible for delivering the mail (e.g.
-/// via sendmail).  It can use `mail_to_rfc2822()` and `write_tmpfile()`
-/// to format and pipe the message.
+/// The on_send hook is responsible for delivering the mail.
+/// It can use `send_smtp()` for built-in SMTP, or `sh()` to pipe
+/// to an external MTA. `on_send` is always required — there is no
+/// automatic send path. The hook receives the profile's SMTP config
+/// via the `_loreread_smtp` Lua global so that `send_smtp()` works.
 fn handle_send(
     state: &LuaState,
     profile_label: &str,
     mail: &ComposeMail,
 ) -> LuaResult {
-    // Look up the profile's resolved SMTP config
+    // Look up the profile's resolved SMTP config (for _loreread_smtp global)
     let smtp = state.profiles.get(profile_label).and_then(|p| p.smtp.as_ref());
 
-    // 1. If on_send hook exists, call it (passing smtp config so send_smtp() works)
-    if let Some(func) = state.config.global_hooks.on_send.as_ref() {
-        eprintln!("[loreread-lua]   calling on_send for '{}'...", profile_label);
-        match state.vm.call_on_send(func, profile_label, mail, smtp) {
-            Ok(()) => {
-                eprintln!("[loreread-lua]   on_send completed");
-                return LuaResult::SendDone { error: None };
-            }
-            Err(e) => {
-                eprintln!("[loreread-lua]   on_send error: {}", e);
-                return LuaResult::SendDone {
-                    error: Some(format!("on_send hook failed: {}", e)),
-                };
-            }
+    let func = match state.config.global_hooks.on_send.as_ref() {
+        Some(f) => f,
+        None => {
+            eprintln!("[loreread-lua]   no on_send hook");
+            return LuaResult::SendDone {
+                error: Some("no on_send hook — define on_send in your config".to_string()),
+            };
         }
-    }
+    };
 
-    // 2. No on_send hook — try automatic SMTP send
-    if let Some(smtp_config) = smtp {
-        eprintln!(
-            "[loreread-lua]   no on_send hook, auto-sending via {}:{}...",
-            smtp_config.host, smtp_config.port
-        );
-        match state.vm.send_smtp_auto(mail, smtp_config) {
-            Ok(()) => {
-                eprintln!("[loreread-lua]   auto-send completed");
-                LuaResult::SendDone { error: None }
-            }
-            Err(e) => {
-                eprintln!("[loreread-lua]   auto-send error: {}", e);
-                LuaResult::SendDone {
-                    error: Some(format!("SMTP send failed: {}", e)),
-                }
-            }
+    eprintln!("[loreread-lua]   calling on_send for '{}'...", profile_label);
+    match state.vm.call_on_send(func, profile_label, mail, smtp) {
+        Ok(()) => {
+            eprintln!("[loreread-lua]   on_send completed");
+            LuaResult::SendDone { error: None }
         }
-    } else {
-        // 3. No hook and no smtp — error
-        eprintln!("[loreread-lua]   no on_send hook and no smtp config");
-        LuaResult::SendDone {
-            error: Some("no on_send hook and no smtp config — mail not delivered".to_string()),
+        Err(e) => {
+            eprintln!("[loreread-lua]   on_send error: {}", e);
+            LuaResult::SendDone {
+                error: Some(format!("on_send hook failed: {}", e)),
+            }
         }
     }
 }

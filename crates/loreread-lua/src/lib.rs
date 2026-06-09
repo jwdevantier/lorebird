@@ -417,28 +417,6 @@ impl Vm {
         Ok(())
     }
 
-    /// Send mail automatically via built-in SMTP (no on_send hook).
-    ///
-    /// Used when a profile has `smtp` config but no `on_send` hook.
-    pub fn send_smtp_auto(
-        &self,
-        mail: &ComposeMail,
-        smtp: &SmtpConfig,
-    ) -> Result<(), loreread_sendmail::SendError> {
-        let rfc2822 = mail.to_rfc2822();
-
-        // Build envelope from the ComposeMail fields
-        let from = extract_email_address(&mail.from);
-        let mut recipients: Vec<String> = Vec::new();
-        recipients.extend(split_addresses(&mail.to));
-        recipients.extend(split_addresses(&mail.cc));
-        recipients.extend(split_addresses(&mail.bcc));
-
-        let to_refs: Vec<&str> = recipients.iter().map(|s| s.as_str()).collect();
-
-        loreread_sendmail::send(smtp, &from, &to_refs, rfc2822.as_bytes())
-    }
-
     /// Set or clear the `_loreread_smtp` Lua global.
     fn set_smtp_global(&self, smtp: Option<&SmtpConfig>) -> LuaResult<()> {
         let globals = self.lua.globals();
