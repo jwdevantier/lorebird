@@ -58,16 +58,15 @@ pub struct SmtpConfig {
     pub password: String,
 
     /// Use STARTTLS (port 587).  If false, use SMTPS wrapper TLS (port 465).
-    #[serde(default = "default_starttls")]
-    pub starttls: bool,
+    ///  If None, automatically derived: port 465 → wrapper TLS, anything else → STARTTLS.
+    #[serde(default)]
+    pub starttls: Option<bool>,
 }
 
 fn default_port() -> u16 {
     587
 }
-fn default_starttls() -> bool {
-    true
-}
+
 
 impl SmtpConfig {
     /// Resolve the password at call time (not at config-load time).
@@ -143,10 +142,18 @@ pub fn send(
         .map_err(|e| SendError::Address(format!("envelope error: {}", e)))?;
 
     // Build the transport
-    let builder = if config.starttls {
-        SmtpTransport::starttls_relay(&config.host)
-            .map_err(|e| SendError::Smtp(format!("TLS setup failed: {}", e)))?
+    // TLS mode: port 587 → STARTTLS, port 465 → wrapper TLS (implicit).
+    // Any other port defaults to STARTTLS. Override with explicit `starttls`
+    // field in config.
+    let use_starttls = if let Some(starttls) = config.starttls {
+        starttls
     } else {
+        config.port != 465
+    };
+
+    let builder = if use_starttls {
+        SmtpTransport::starttls_relay(&config.host)
+            .map_err(|e| SendError::Smtp(format!("TLS setup failed: {}", e)))? } else {
         SmtpTransport::relay(&config.host)
             .map_err(|e| SendError::Smtp(format!("TLS setup failed: {}", e)))?
     };
@@ -180,7 +187,7 @@ mod tests {
             r#"{"host":"smtp.example.com","username":"user@example.com","password":"secret"}"#
         ).unwrap();
         assert_eq!(config.port, 587);
-        assert!(config.starttls);
+        assert_eq!(config.starttls, None);  // derieved from port at send time
     }
 
     #[test]
@@ -189,7 +196,23 @@ mod tests {
             r#"{"host":"smtp.example.com","port":465,"username":"u","password":"p","starttls":false}"#
         ).unwrap();
         assert_eq!(config.port, 465);
-        assert!(!config.starttls);
+        assert_eq!(config.starttls, Some(false));
+    }
+
+    #[test]
+    fn starttls_derived_from_port() {
+        // port 587, no explicit starttls → STARTTLS
+        let config: SmtpConfig = serde_json::from_str(
+            r#"{"host":"smtp.example.com","username":"u","password":"p"}"#
+        ).unwrap();
+        assert!(if let Some(s) = config.starttls { s } else { config.port != 465 });
+
+        // port 465, no explicit starttls → wrapper TLS
+        let config: SmtpConfig = serde_json::from_str(
+            r#"{"host":"smtp.example.com","port":465,"username":"u","password":"p"}"#
+        ).unwrap();
+        let use_starttls = if let Some(s) = config.starttls { s } else { config.port != 465 };
+        assert!(!use_starttls);
     }
 
     #[test]

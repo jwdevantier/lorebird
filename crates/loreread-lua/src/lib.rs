@@ -1038,7 +1038,7 @@ config = {
         assert_eq!(smtp.host, "smtp.example.com");
         assert_eq!(smtp.port, 587);
         assert_eq!(smtp.username, "user@example.com");
-        assert!(smtp.starttls);
+        assert_eq!(smtp.starttls, Some(true));
 
         assert!(resolved["personal"].smtp.is_none());
     }

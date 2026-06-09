@@ -289,7 +289,7 @@ mod tests {
                 port: 587,
                 username: "me@gmail.com".to_string(),
                 password: "secret".to_string(),
-                starttls: true,
+                starttls: Some(true),
             }),
         };
         let resolved = data.resolve("work", None);
@@ -297,7 +297,7 @@ mod tests {
         let smtp = resolved.smtp.as_ref().unwrap();
         assert_eq!(smtp.host, "smtp.gmail.com");
         assert_eq!(smtp.username, "me@gmail.com");
-        assert!(smtp.starttls);
+        assert_eq!(smtp.starttls, Some(true));
     }
 
     #[test]
