@@ -1,4 +1,4 @@
-# loreread
+# lorebird
 
 **Index and browse a maildir with GTK, Lua, and SQLite.**
 
@@ -12,30 +12,30 @@ for extensibility, backed by SQLite with full-text search (FTS5).
 nix build
 
 # Run it
-./result/bin/loreread
+./result/bin/lorebird
 
 # Or enter the dev shell and cargo-run
 nix develop
-cargo run -p loreread
+cargo run -p lorebird
 ```
 
 ## Workspace structure
 
 ```
-loreread/
+lorebird/
 ├── Cargo.toml                 # workspace manifest
 ├── Cargo.lock
 ├── flake.nix
 ├── crates/
-│   ├── loreread-core/         # email logic: threading, schema, indexing, query
+│   ├── lorebird-core/         # email logic: threading, schema, indexing, query
 │   │   └── src/
 │   │       ├── thread.rs      # JWZ threading algorithm
 │   │       ├── message.rs     # mail_parser → domain types bridge
 │   │       ├── schema.rs      # SQLite FTS5 tables & migrations
 │   │       ├── indexer.rs     # maildir → SQLite indexer
 │   │       └── query.rs       # FTS5 query parser & search
-│   ├── loreread-lua/          # Lua VM integration (mlua)
-│   └── loreread-gtk/          # GTK4 UI (binary: loreread)
+│   ├── lorebird-lua/          # Lua VM integration (mlua)
+│   └── lorebird-gtk/          # GTK4 UI (binary: lorebird)
 └── tools/
     ├── maildir-index/         # CLI: index a maildir into SQLite
     └── thread-test/           # CLI: run JWZ threading on a maildir
@@ -63,21 +63,21 @@ This drops you into a shell with:
 
 ### Fast iteration (no GTK)
 
-Most logic lives in `loreread-core` which has **zero GUI dependencies** —
+Most logic lives in `lorebird-core` which has **zero GUI dependencies** —
 builds in ~0.2s instead of ~45s.
 
 ```bash
 # Check core for errors (fast)
-cargo check -p loreread-core
+cargo check -p lorebird-core
 
 # Run all core tests (36 tests, <0.1s)
-cargo test -p loreread-core
+cargo test -p lorebird-core
 
 # Run only thread tests (26 tests)
-cargo test -p loreread-core thread::
+cargo test -p lorebird-core thread::
 
 # Run a single test
-cargo test -p loreread-core thread::tests::linear_thread_by_references
+cargo test -p lorebird-core thread::tests::linear_thread_by_references
 ```
 
 ### Edit-Compile-Run loop
@@ -87,7 +87,7 @@ nix develop               # enter shell once
 
 cargo check --workspace   # check everything (fast)
 cargo build --workspace   # debug build all
-cargo run -p loreread     # build + run the GTK app
+cargo run -p lorebird     # build + run the GTK app
 cargo test --workspace    # run all tests
 
 # Release build
@@ -152,33 +152,33 @@ management — Nix reads `Cargo.lock` directly.
 
 ### GTK (GUI)
 
-The `loreread-gtk` crate provides the GTK4 UI. It depends on `loreread-core`
-for all email logic and `loreread-lua` for scripting/config.
+The `lorebird-gtk` crate provides the GTK4 UI. It depends on `lorebird-core`
+for all email logic and `lorebird-lua` for scripting/config.
 
 ### Lua (configuration & hooks)
 
-`loreread-lua` wraps `mlua` (Lua 5.4, vendored). Configuration, fetch hooks,
+`lorebird-lua` wraps `mlua` (Lua 5.4, vendored). Configuration, fetch hooks,
 reply templates, and send hooks are all expressed in Lua — much like neovim's
 approach. The VM is started at app launch and exposes APIs for maildir
 operations, searching, and UI callbacks.
 
 ### SQLite + FTS5
 
-`loreread-core` uses `rusqlite` (v0.39, bundled) with FTS5 for full-text
+`lorebird-core` uses `rusqlite` (v0.39, bundled) with FTS5 for full-text
 search. The schema module creates tables, triggers, and the FTS5 virtual table.
 The query module provides a Xapian-style query parser that compiles to FTS5
 MATCH expressions.
 
 ### Mail parsing
 
-`loreread-core` uses `mail-parser` (Stalwart Labs, v0.10) to parse raw email
+`lorebird-core` uses `mail-parser` (Stalwart Labs, v0.10) to parse raw email
 bytes. The `message.rs` module extracts the fields we care about (Message-ID,
 References, Subject, From, Date, body) and implements the `thread::Message`
 trait so parsed messages can be fed directly to the JWZ threading algorithm.
 
 ### Maildir indexing
 
-`loreread-core` walks the maildir filesystem directly (no `maildir` crate) —
+`lorebird-core` walks the maildir filesystem directly (no `maildir` crate) —
 iterating `cur/` and `new/` subdirectories, reading each file as raw bytes,
 and passing them to `mail_parser`. The `maildir-index` CLI tool exercises this
 code path independently of the GUI.
@@ -202,5 +202,5 @@ Then use standard Cargo commands:
 
 ```bash
 cargo build --release
-./target/release/loreread
+./target/release/lorebird
 ```

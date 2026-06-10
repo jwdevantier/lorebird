@@ -1,5 +1,5 @@
 {
-  description = "loreread — index and browse a maildir with GTK, Lua, and SQLite";
+  description = "lorebird — index and browse a maildir with GTK, Lua, and SQLite";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -24,7 +24,7 @@
     {
       devShells = forAllSystems ({ pkgs, system }: {
         default = pkgs.mkShell {
-          name = "loreread-dev";
+          name = "lorebird-dev";
 
           nativeBuildInputs = with pkgs; [
             pkg-config
@@ -45,7 +45,7 @@
           ];
 
           shellHook = ''
-            echo "=== loreread dev shell ==="
+            echo "=== lorebird dev shell ==="
             echo "Rust:  $(rustc --version)"
             echo "GTK4:  ${pkgs.gtk4.version}"
             echo "GtkSourceView: ${pkgs.gtksourceview5.version}"
@@ -57,8 +57,8 @@
 
       packages = forAllSystems ({ pkgs, system }:
         let
-          loreread = pkgs.rustPlatform.buildRustPackage {
-            pname = "loreread";
+          lorebird = pkgs.rustPlatform.buildRustPackage {
+            pname = "lorebird";
             version = "0.1.0";
             src = ./.;
 
@@ -80,11 +80,11 @@
 
             desktopItems = [
               (pkgs.makeDesktopItem {
-                name = "org.loreread.app";
-                exec = "loreread";
-                icon = "org.loreread.app";
+                name = "org.lorebird.app";
+                exec = "lorebird";
+                icon = "org.lorebird.app";
                 comment = "Lightweight mail reader for lore.kernel.org";
-                desktopName = "loreread";
+                desktopName = "lorebird";
                 categories = [ "Network" "Email" ];
               })
             ];
@@ -93,15 +93,15 @@
               # Install icons into the hicolor icon theme
               for size in 16 32 48 64 128 256; do
                 mkdir -p $out/share/icons/hicolor/''${size}x''${size}/apps
-                cp icon/org.loreread.app.''${size}.png \
-                  $out/share/icons/hicolor/''${size}x''${size}/apps/org.loreread.app.png
+                cp icon/org.lorebird.app.''${size}.png \
+                  $out/share/icons/hicolor/''${size}x''${size}/apps/org.lorebird.app.png
               done
             '';
           };
         in
         {
-          default = loreread;
-          loreread = loreread;
+          default = lorebird;
+          lorebird = lorebird;
         });
     };
 }

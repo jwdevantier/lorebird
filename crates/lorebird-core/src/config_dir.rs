@@ -45,30 +45,30 @@ pub fn config_dir() -> Option<PathBuf> {
     }
 }
 
-/// Return the full path to loreread's config directory (without filename).
+/// Return the full path to lorebird's config directory (without filename).
 ///
 /// | Platform | Path |
 /// |----------|------|
-/// | Linux/BSD | `~/.config/loreread/` |
-/// | macOS | `~/Library/Application Support/loreread/` |
-/// | Windows | `%APPDATA%\loreread\` |
+/// | Linux/BSD | `~/.config/lorebird/` |
+/// | macOS | `~/Library/Application Support/lorebird/` |
+/// | Windows | `%APPDATA%\lorebird\` |
 ///
 /// Returns `None` when the OS config directory cannot be determined.
-pub fn loreread_confdir() -> Option<PathBuf> {
-    config_dir().map(|d| d.join("loreread"))
+pub fn lorebird_confdir() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("lorebird"))
 }
 
-/// Return the full path to loreread's config file.
+/// Return the full path to lorebird's config file.
 ///
 /// | Platform | Path |
 /// |----------|------|
-/// | Linux/BSD | `~/.config/loreread/config.lua` |
-/// | macOS | `~/Library/Application Support/loreread/config.lua` |
-/// | Windows | `%APPDATA%\loreread\config.lua` |
+/// | Linux/BSD | `~/.config/lorebird/config.lua` |
+/// | macOS | `~/Library/Application Support/lorebird/config.lua` |
+/// | Windows | `%APPDATA%\lorebird\config.lua` |
 ///
 /// Returns `None` when the OS config directory cannot be determined.
-pub fn loreread_conf_path() -> Option<PathBuf> {
-    config_dir().map(|d| d.join("loreread").join("config.lua"))
+pub fn lorebird_conf_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("lorebird").join("config.lua"))
 }
 
 // ── Unix/macOS home directory ─────────────────────────────────────────
@@ -111,23 +111,23 @@ mod tests {
     }
 
     #[test]
-    fn loreread_conf_path_returns_something() {
-        let path = loreread_conf_path();
-        assert!(path.is_some(), "loreread_conf_path() returned None");
+    fn lorebird_conf_path_returns_something() {
+        let path = lorebird_conf_path();
+        assert!(path.is_some(), "lorebird_conf_path() returned None");
         let path = path.unwrap();
-        assert!(path.is_absolute(), "loreread_conf_path() must return an absolute path, got {:?}", path);
-        assert!(path.ends_with("loreread/config.lua"),
-            "loreread_conf_path() should end with loreread/config.lua, got {:?}", path);
+        assert!(path.is_absolute(), "lorebird_conf_path() must return an absolute path, got {:?}", path);
+        assert!(path.ends_with("lorebird/config.lua"),
+            "lorebird_conf_path() should end with lorebird/config.lua, got {:?}", path);
     }
 
     #[test]
-    fn loreread_confdir_returns_something() {
-        let dir = loreread_confdir();
-        assert!(dir.is_some(), "loreread_confdir() returned None");
+    fn lorebird_confdir_returns_something() {
+        let dir = lorebird_confdir();
+        assert!(dir.is_some(), "lorebird_confdir() returned None");
         let dir = dir.unwrap();
-        assert!(dir.is_absolute(), "loreread_confdir() must return an absolute path, got {:?}", dir);
-        assert!(dir.ends_with("loreread"),
-            "loreread_confdir() should end with loreread, got {:?}", dir);
+        assert!(dir.is_absolute(), "lorebird_confdir() must return an absolute path, got {:?}", dir);
+        assert!(dir.ends_with("lorebird"),
+            "lorebird_confdir() should end with lorebird, got {:?}", dir);
     }
 
     #[test]

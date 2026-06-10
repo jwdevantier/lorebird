@@ -8,5 +8,5 @@ name = "lorefetch"
 path = "src/main.rs"
 
 [dependencies]
-loreread-lorefetch = { path = "../../crates/loreread-lorefetch" }
+lorebird-lorefetch = { path = "../../crates/lorebird-lorefetch" }
 clap = { version = "4", features = ["derive"] }

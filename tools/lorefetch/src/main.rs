@@ -89,7 +89,7 @@ fn main() {
     let verbose = args.verbose >= 2;
 
     if let Some(maildir) = args.maildir {
-        match loreread_lorefetch::fetch_to_maildir(
+        match lorebird_lorefetch::fetch_to_maildir(
             &args.query,
             args.list.as_deref(),
             &maildir,
@@ -107,7 +107,7 @@ fn main() {
             }
         }
     } else if let Some(mbox_path) = args.mbox {
-        let client = loreread_lorefetch::LoreClient::new().verbose(verbose);
+        let client = lorebird_lorefetch::LoreClient::new().verbose(verbose);
         match client.fetch_mbox_to_file(&args.query, args.list.as_deref(), &mbox_path) {
             Ok(written) => {
                 eprintln!("Wrote {} bytes to {}", written, mbox_path.display());

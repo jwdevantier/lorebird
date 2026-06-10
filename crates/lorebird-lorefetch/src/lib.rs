@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: 2025 Jesper Devantier <jwd@defmacro.it>
-// Ported from Go to Rust by the loreread project.
+// Ported from Go to Rust by the lorebird project.
 
 //! Fetch mailing-list threads from lore.kernel.org into a maildir.
 //!

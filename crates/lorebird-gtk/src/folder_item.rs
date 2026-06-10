@@ -35,7 +35,7 @@ mod imp {
 
     #[glib::object_subclass]
     impl ObjectSubclass for FolderItemInner {
-        const NAME: &'static str = "LorereadFolderItem";
+        const NAME: &'static str = "LorebirdFolderItem";
         type Type = super::FolderItem;
     }
 

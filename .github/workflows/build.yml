@@ -55,28 +55,28 @@ jobs:
           restore-keys: cargo-windows-ucrt64-
 
       - name: Build
-        run: cargo build --release -p loreread
+        run: cargo build --release -p lorebird
 
       - name: Bundle
         run: |
           mkdir -p dist
-          bash scripts/win-ucr64t-bundler.sh target/release/loreread.exe dist/loreread
-          cp crates/loreread-gtk/resources/org.loreread.app.ico dist/loreread/
+          bash scripts/win-ucr64t-bundler.sh target/release/lorebird.exe dist/lorebird
+          cp crates/lorebird-gtk/resources/org.lorebird.app.ico dist/lorebird/
 
       - name: Upload artifact (PRs)
         uses: actions/upload-artifact@v4
         with:
-          name: loreread-windows-x86_64
-          path: dist/loreread/
+          name: lorebird-windows-x86_64
+          path: dist/lorebird/
 
       - name: Create zip and upload release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          cd dist/loreread
-          zip -r ../../../loreread-${{ github.ref_name }}-windows-x86_64.zip *
+          cd dist/lorebird
+          zip -r ../../../lorebird-${{ github.ref_name }}-windows-x86_64.zip *
 
       - name: Upload release asset
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: loreread-${{ github.ref_name }}-windows-x86_64.zip
+          files: lorebird-${{ github.ref_name }}-windows-x86_64.zip

@@ -12,7 +12,7 @@
 
 use std::io::{self, BufRead, Write};
 
-use loreread_core::query::{parse_query, query_to_fts5};
+use lorebird_core::query::{parse_query, query_to_fts5};
 
 fn main() {
     let stdin = io::stdin();

@@ -9,10 +9,10 @@
 //! (no threading).
 
 use clap::Parser;
-use loreread_core::message::MailMessage;
-use loreread_core::query::{self, ParsedQuery};
-use loreread_core::schema;
-use loreread_core::thread::{self, Thread};
+use lorebird_core::message::MailMessage;
+use lorebird_core::query::{self, ParsedQuery};
+use lorebird_core::schema;
+use lorebird_core::thread::{self, Thread};
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::PathBuf;

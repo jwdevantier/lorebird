@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "crates/loreread-core",
-    "crates/loreread-lua",
-    "crates/loreread-gtk",
-    "crates/loreread-lorefetch",
-    "crates/loreread-sendmail",
+    "crates/lorebird-core",
+    "crates/lorebird-lua",
+    "crates/lorebird-gtk",
+    "crates/lorebird-lorefetch",
+    "crates/lorebird-sendmail",
     "tools/maildir-index",
     "tools/mail-query",
     "tools/query-test",

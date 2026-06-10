@@ -16,7 +16,7 @@ use gtk4::{
 use sourceview5 as sv;
 use sourceview5::prelude::*;
 
-use loreread_core::compose::ComposeMail;
+use lorebird_core::compose::ComposeMail;
 
 use crate::app_state::AppState;
 use crate::lua_thread::LuaCommand;

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/org/lorebird/app">
+    <file>org.lorebird.app.16.png</file>
+    <file>org.lorebird.app.32.png</file>
+    <file>org.lorebird.app.48.png</file>
+    <file>org.lorebird.app.64.png</file>
+    <file>org.lorebird.app.128.png</file>
+    <file>org.lorebird.app.256.png</file>
+  </gresource>
+  <gresource prefix="/org/lorebird/app/icons/scalable/apps">
+    <file alias="org.lorebird.app.png">org.lorebird.app.256.png</file>
+  </gresource>
+</gresources>

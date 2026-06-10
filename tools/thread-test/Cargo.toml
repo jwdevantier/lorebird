@@ -8,6 +8,6 @@ name = "thread-test"
 path = "src/main.rs"
 
 [dependencies]
-loreread-core = { path = "../../crates/loreread-core" }
+lorebird-core = { path = "../../crates/lorebird-core" }
 mail-parser = "0.10"
 clap = { version = "4", features = ["derive"] }

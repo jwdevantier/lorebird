@@ -14,9 +14,9 @@ use rusqlite::Connection;
 
 use crate::lua_thread::{InitResult, LuaCommand, LuaResult, LuaThread};
 use crate::thread_node::ThreadNode;
-use loreread_core::store::DbMessage;
-use loreread_core::thread::{self, Thread};
-use loreread_lua::ResolvedProfile;
+use lorebird_core::store::DbMessage;
+use lorebird_core::thread::{self, Thread};
+use lorebird_lua::ResolvedProfile;
 
 /// Central application state, shared between the window and action callbacks.
 pub struct AppState {
@@ -67,7 +67,7 @@ impl AppState {
         let init = match lua_thread.recv_init() {
             Ok(init) => init,
             Err(e) => {
-                eprintln!("[loreread] warning: {}", e);
+                eprintln!("[lorebird] warning: {}", e);
                 InitResult {
                     profiles: HashMap::new(),
                     theme: "light".to_string(),
@@ -141,10 +141,10 @@ impl AppState {
 
     /// Open (or create) the index database for `maildir`.
     pub fn open_db(&self, maildir: &std::path::Path) -> Result<(), String> {
-        let db_path = maildir.join(".loreread.db");
+        let db_path = maildir.join(".lorebird.db");
         let conn = Connection::open(&db_path)
             .map_err(|e| format!("cannot open database: {}", e))?;
-        loreread_core::schema::init_db(&conn)
+        lorebird_core::schema::init_db(&conn)
             .map_err(|e| format!("cannot init schema: {}", e))?;
         *self.db.borrow_mut() = Some(conn);
         *self.db_maildir.borrow_mut() = maildir.to_path_buf();
@@ -221,7 +221,7 @@ impl AppState {
         conn: &Connection,
         maildir: &std::path::Path,
     ) -> Result<(), String> {
-        let messages = loreread_core::store::load_all_messages(conn)
+        let messages = lorebird_core::store::load_all_messages(conn)
             .map_err(|e| format!("query failed: {}", e))?;
         let threads = thread::thread_messages(messages);
 
@@ -239,18 +239,18 @@ impl AppState {
         maildir: &std::path::Path,
         query: &str,
     ) -> Result<usize, String> {
-        let parsed = loreread_core::query::parse_query(query)
+        let parsed = lorebird_core::query::parse_query(query)
             .map_err(|e| format!("bad query '{}': {:?}", query, e))?;
-        let pq = loreread_core::query::ParsedQuery::from_ast(&parsed, 5000);
+        let pq = lorebird_core::query::ParsedQuery::from_ast(&parsed, 5000);
 
         let db = self.db.borrow();
         let conn = db.as_ref().ok_or("database not open")?;
 
-        let matched_ids: Vec<String> = loreread_core::query::search(conn, &pq)
+        let matched_ids: Vec<String> = lorebird_core::query::search(conn, &pq)
             .map_err(|e| format!("search failed: {}", e))?;
         let match_count = matched_ids.len();
 
-        let all_messages = loreread_core::store::load_all_messages(conn)
+        let all_messages = lorebird_core::store::load_all_messages(conn)
             .map_err(|e| format!("query failed: {}", e))?;
         let threads = thread::thread_messages(all_messages);
 
@@ -308,7 +308,7 @@ impl ThreadNodeTree {
         // Try to read the full message from disk for rich data.
         // Fall back to the DB row data when the file is missing.
         let parsed = msg.as_ref().and_then(|m| {
-            loreread_core::store::read_raw_message(maildir, &m.filename)
+            lorebird_core::store::read_raw_message(maildir, &m.filename)
         });
 
         let (from, to, cc, body, parsed_refs, parsed_date, parsed_mid, parsed_irt) =

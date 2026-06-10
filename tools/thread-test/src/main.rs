@@ -7,8 +7,8 @@
 //! the JWZ algorithm, and prints the resulting thread tree.
 
 use clap::Parser;
-use loreread_core::message::MailMessage;
-use loreread_core::thread::{self, Thread};
+use lorebird_core::message::MailMessage;
+use lorebird_core::thread::{self, Thread};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -109,7 +109,7 @@ fn count_messages(threads: &[Thread<MailMessage>]) -> usize {
     threads.iter().map(count_one).sum()
 }
 
-fn count_one<T: loreread_core::thread::Message>(t: &Thread<T>) -> usize {
+fn count_one<T: lorebird_core::thread::Message>(t: &Thread<T>) -> usize {
     let mut n = if t.message.is_some() { 1 } else { 0 };
     for child in &t.children {
         n += count_one(child);

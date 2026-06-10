@@ -1,4 +1,4 @@
-//! Configuration types for loreread.
+//! Configuration types for lorebird.
 //!
 //! These types represent the data portion of a Lua config file,
 //! deserialised via `mlua::serde`.  Lua function hooks (`on_fetch`,
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use loreread_sendmail::SmtpConfig;
+use lorebird_sendmail::SmtpConfig;
 
 // ── Data types (serde-deserialisable) ─────────────────────────────
 

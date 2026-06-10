@@ -1,4 +1,4 @@
-//! Lua VM integration for loreread.
+//! Lua VM integration for lorebird.
 //!
 //! Wraps mlua to provide:
 //! - Configuration loading (profiles, views, hooks)
@@ -11,8 +11,8 @@ pub use config::{
     AppConfig, GlobalHooks, LoadedConfig, ProfileData, ProfileHooks, ResolvedProfile, UserInfo,
     ViewConfig,
 };
-pub use loreread_core::compose::{ComposeMail, ParentMail};
-pub use loreread_sendmail::{SendError, SmtpConfig};
+pub use lorebird_core::compose::{ComposeMail, ParentMail};
+pub use lorebird_sendmail::{SendError, SmtpConfig};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,7 +24,7 @@ use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 /// Temp-file counter for unique filenames.
 static TMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A Lua VM configured with the loreread API.
+/// A Lua VM configured with the lorebird API.
 pub struct Vm {
     lua: Lua,
     /// Paths to temporary files created by `write_tmpfile`,
@@ -33,7 +33,7 @@ pub struct Vm {
 }
 
 impl Vm {
-    /// Create a new Lua VM and register the loreread API surface.
+    /// Create a new Lua VM and register the lorebird API surface.
     ///
     /// The following globals are available to Lua scripts:
     ///
@@ -51,7 +51,7 @@ impl Vm {
 
     // ── API helpers ─────────────────────────────────────────────
 
-    /// Register loreread API functions as Lua globals.
+    /// Register lorebird API functions as Lua globals.
     fn register_helpers(&self) -> LuaResult<()> {
         // ── sh(cmd) → { ok, exit_code, stdout, stderr } ────────
         let sh_fn = self.lua.create_function(|lua, args: Table| {
@@ -114,7 +114,7 @@ impl Vm {
         let write_tmpfile_fn = self.lua.create_function(|_lua, content: String| {
             let count = TMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
             let pid = std::process::id();
-            let name = format!("loreread_{}_{}", pid, count);
+            let name = format!("lorebird_{}_{}", pid, count);
             let path = std::env::temp_dir().join(name);
             std::fs::write(&path, &content)
                 .map_err(|e| mlua::Error::external(format!("write_tmpfile: {}", e)))?;
@@ -140,7 +140,7 @@ impl Vm {
         let lorefetch_fn =
             self.lua
                 .create_function(|lua, (maildir, query): (String, String)| {
-                    let result = loreread_lorefetch::fetch_to_maildir(
+                    let result = lorebird_lorefetch::fetch_to_maildir(
                         &query,
                         None, // search /all/ by default
                         std::path::Path::new(&maildir),
@@ -169,19 +169,19 @@ impl Vm {
 
         // ── send_smtp(rfc2822_text) → { ok, error? } ────────────────
         //   Send an RFC 2822 message via the profile's SMTP config.
-        //   The SMTP config is set as a Lua global (_loreread_smtp)
+        //   The SMTP config is set as a Lua global (_lorebird_smtp)
         //   by the send dispatch code before calling on_send.
         //   If no config is set, returns { ok=false, error="..." }.
         let send_smtp_fn = self.lua.create_function(|lua, rfc2822: String| {
             let globals = lua.globals();
-            let smtp_val: mlua::Value = globals.get("_loreread_smtp").unwrap_or(mlua::Value::Nil);
+            let smtp_val: mlua::Value = globals.get("_lorebird_smtp").unwrap_or(mlua::Value::Nil);
 
             let table = lua.create_table()?;
             match smtp_val {
                 mlua::Value::Table(t) => {
                     // Deserialize the smtp table from Lua
                     let options = DeserializeOptions::new().deny_unsupported_types(false);
-                    let smtp_config: loreread_sendmail::SmtpConfig = lua
+                    let smtp_config: lorebird_sendmail::SmtpConfig = lua
                         .from_value_with(t.into_lua(lua)?, options)
                         .map_err(|e| {
                             mlua::Error::external(format!("invalid smtp config: {}", e))
@@ -245,7 +245,7 @@ impl Vm {
                         return Ok(table);
                     }
 
-                    match loreread_sendmail::send(
+                    match lorebird_sendmail::send(
                         &smtp_config,
                         &from_addr,
                         &all_recipients,
@@ -431,7 +431,7 @@ impl Vm {
     /// deliver the mail, or call `send_smtp()` for built-in SMTP.
     ///
     /// Before calling the hook, the SMTP config (if any) is set as
-    /// the Lua global `_loreread_smtp` so that `send_smtp()` can
+    /// the Lua global `_lorebird_smtp` so that `send_smtp()` can
     /// access it.
     pub fn call_on_send(
         &self,
@@ -446,17 +446,17 @@ impl Vm {
         Ok(())
     }
 
-    /// Set or clear the `_loreread_smtp` Lua global.
+    /// Set or clear the `_lorebird_smtp` Lua global.
     fn set_smtp_global(&self, smtp: Option<&SmtpConfig>) -> LuaResult<()> {
         let globals = self.lua.globals();
         match smtp {
             Some(config) => {
                 // Serialize SmtpConfig to a Lua table
                 let value = self.lua.to_value(&config)?;
-                globals.set("_loreread_smtp", value)?;
+                globals.set("_lorebird_smtp", value)?;
             }
             None => {
-                globals.set("_loreread_smtp", mlua::Value::Nil)?;
+                globals.set("_lorebird_smtp", mlua::Value::Nil)?;
             }
         }
         Ok(())
@@ -771,7 +771,7 @@ config = {
     #[test]
     fn read_file_helper() {
         let vm = Vm::new().unwrap();
-        let tmp = std::env::temp_dir().join("loreread_test_read_file.txt");
+        let tmp = std::env::temp_dir().join("lorebird_test_read_file.txt");
         std::fs::write(&tmp, "hello from file").unwrap();
         let code = format!(r#"return read_file("{}")"#, tmp.display());
         let content: String = vm.lua.load(&code).eval().unwrap();
@@ -843,7 +843,7 @@ local mail = {
   in_reply_to = "<parent@example.com>",
   references = "<grandparent@example.com> <parent@example.com>",
   body_text = "Hello\n",
-  headers = { ["X-Mailer"] = "loreread" },
+  headers = { ["X-Mailer"] = "lorebird" },
 }
 return mail_to_rfc2822(mail)
 "#,
@@ -854,14 +854,14 @@ return mail_to_rfc2822(mail)
         assert!(result.contains("To: Bob <bob@example.com>"));
         assert!(result.contains("Subject: Test"));
         assert!(result.contains("In-Reply-To: <parent@example.com>"));
-        assert!(result.contains("X-Mailer: loreread"));
+        assert!(result.contains("X-Mailer: lorebird"));
         assert!(result.contains("Hello"));
         // Auto-generated headers
         assert!(result.contains("Date: "));
         assert!(result.contains("Message-ID: <"));
         assert!(result.contains("MIME-Version: 1.0"));
         assert!(result.contains("Content-Type: text/plain; charset=utf-8"));
-        assert!(result.contains("X-Mailer: loreread"));
+        assert!(result.contains("X-Mailer: lorebird"));
     }
 
     #[test]
@@ -884,7 +884,7 @@ config = {
         let loaded = vm.load_config_string(code).unwrap();
         let on_reply = loaded.global_hooks.on_reply.as_ref().unwrap();
 
-        let parent = loreread_core::compose::ParentMail {
+        let parent = lorebird_core::compose::ParentMail {
             message_id: Some("<abc@def>".to_string()),
             from: "Alice <alice@example.com>".to_string(),
             to: "list@example.com".to_string(),
@@ -896,7 +896,7 @@ config = {
             body_text: "Original body".to_string(),
             headers: std::collections::HashMap::new(),
         };
-        let mail = loreread_core::compose::ComposeMail::new_reply(
+        let mail = lorebird_core::compose::ComposeMail::new_reply(
             &parent,
             "Riccardo",
             "riccardo@defmacro.it",
@@ -930,7 +930,7 @@ config = {
         let loaded = vm.load_config_string(code).unwrap();
         let on_reply = loaded.global_hooks.on_reply.as_ref().unwrap();
 
-        let parent = loreread_core::compose::ParentMail {
+        let parent = lorebird_core::compose::ParentMail {
             message_id: Some("<abc@def>".to_string()),
             from: "Alice <alice@example.com>".to_string(),
             to: String::new(),
@@ -943,7 +943,7 @@ config = {
             headers: std::collections::HashMap::new(),
         };
         let mail =
-            loreread_core::compose::ComposeMail::new_reply(&parent, "Bob", "bob@example.com");
+            lorebird_core::compose::ComposeMail::new_reply(&parent, "Bob", "bob@example.com");
 
         // The hook modifies mail.cc in-place; we always get back the
         // (potentially modified) mail, never None.
@@ -955,7 +955,7 @@ config = {
     fn call_on_send_invokes_hook() {
         let vm = Vm::new().unwrap();
         // Use a write_tmpfile-based on_send that we can verify
-        let tmp = std::env::temp_dir().join("loreread_test_on_send.txt");
+        let tmp = std::env::temp_dir().join("lorebird_test_on_send.txt");
         let tmp_path = tmp.display().to_string();
         let code = format!(
             r#"
@@ -978,7 +978,7 @@ config = {{
         let loaded = vm.load_config_string(&code).unwrap();
         let on_send = loaded.global_hooks.on_send.as_ref().unwrap();
 
-        let mail = loreread_core::compose::ComposeMail {
+        let mail = lorebird_core::compose::ComposeMail {
             from: "Alice <alice@example.com>".to_string(),
             to: "Bob <bob@example.com>".to_string(),
             cc: String::new(),

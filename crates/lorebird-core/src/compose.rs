@@ -162,7 +162,7 @@ impl ComposeMail {
             out.push_str("Content-Type: text/plain; charset=utf-8\n");
         }
         if !user_keys.contains("X-Mailer") {
-            out.push_str("X-Mailer: loreread\n");
+            out.push_str("X-Mailer: lorebird\n");
         }
 
         // ── Arbitrary user headers in sorted order ──
@@ -497,7 +497,7 @@ mod tests {
         // Auto-generated MIME / X-Mailer headers
         assert!(rfc.contains("MIME-Version: 1.0\n"));
         assert!(rfc.contains("Content-Type: text/plain; charset=utf-8\n"));
-        assert!(rfc.contains("X-Mailer: loreread\n"));
+        assert!(rfc.contains("X-Mailer: lorebird\n"));
         // User custom header
         assert!(rfc.contains("X-Custom: value\n"));
         // Blank line + body
@@ -526,7 +526,7 @@ mod tests {
         assert!(rfc.contains("@b>")); // from "A <a@b>"
         assert!(rfc.contains("MIME-Version: 1.0"));
         assert!(rfc.contains("Content-Type: text/plain; charset=utf-8"));
-        assert!(rfc.contains("X-Mailer: loreread"));
+        assert!(rfc.contains("X-Mailer: lorebird"));
         assert!(!rfc.contains("In-Reply-To:"));
         assert!(!rfc.contains("References:"));
         assert!(!rfc.contains("Cc:"));

@@ -68,7 +68,7 @@ mod imp {
 
     #[glib::object_subclass]
     impl ObjectSubclass for ThreadNodeInner {
-        const NAME: &'static str = "LorereadThreadNode";
+        const NAME: &'static str = "LorebirdThreadNode";
         type Type = super::ThreadNode;
     }
 

@@ -1,5 +1,5 @@
 [package]
-name = "loreread-sendmail"
+name = "lorebird-sendmail"
 version = "0.1.0"
 edition = "2024"
 description = "Send email via SMTP (built on lettre)"

@@ -11,7 +11,7 @@
 //! Pass `--rebuild` to drop and recreate the index from scratch.
 
 use clap::Parser;
-use loreread_core::{indexer, schema};
+use lorebird_core::{indexer, schema};
 use rusqlite::Connection;
 use std::path::PathBuf;
 

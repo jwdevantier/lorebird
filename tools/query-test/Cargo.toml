@@ -8,4 +8,4 @@ name = "query-test"
 path = "src/main.rs"
 
 [dependencies]
-loreread-core = { path = "../../crates/loreread-core" }
+lorebird-core = { path = "../../crates/lorebird-core" }

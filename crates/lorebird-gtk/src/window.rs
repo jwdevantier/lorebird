@@ -26,11 +26,11 @@ use crate::compose::{self, ComposeContext};
 use crate::folder_item::FolderItem;
 use crate::lua_thread::LuaCommand;
 use crate::thread_node::ThreadNode;
-use loreread_core::compose::ComposeMail;
+use lorebird_core::compose::ComposeMail;
 
 // ── Public entry point ─────────────────────────────────────────────
 
-/// Build and present the main loreread window.
+/// Build and present the main lorebird window.
 pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let state_ref = state.borrow();
 
@@ -42,8 +42,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("loreread")
-        .icon_name("org.loreread.app")
+        .title("lorebird")
+        .icon_name("org.lorebird.app")
         .default_width(1200)
         .default_height(700)
         .build();
@@ -62,7 +62,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     // ── Header bar ────────────────────────────────────────────
     let header = HeaderBar::new();
-    let title_label = Label::new(Some("loreread"));
+    let title_label = Label::new(Some("lorebird"));
     title_label.add_css_class("title");
     header.set_title_widget(Some(&title_label));
 
@@ -450,12 +450,12 @@ fn trigger_reply(
     let filename = node.filename();
     let maildir = s.active_maildir.borrow().clone();
     let headers = if !filename.is_empty() {
-        loreread_core::store::read_raw_headers(&maildir, &filename).unwrap_or_default()
+        lorebird_core::store::read_raw_headers(&maildir, &filename).unwrap_or_default()
     } else {
         HashMap::new()
     };
 
-    let parent = loreread_core::compose::ParentMail {
+    let parent = lorebird_core::compose::ParentMail {
         message_id: {
             let mid = node.message_id();
             if mid.is_empty() { None } else { Some(mid) }
@@ -582,9 +582,9 @@ fn build_sidebar(state: &AppState) -> (ScrolledWindow, ListStore, gtk4::ListBox)
             "No profiles configured.\n\n\
                  Create {}\n\
                  or start with --config <path>",
-            loreread_core::config_dir::loreread_conf_path()
+            lorebird_core::config_dir::lorebird_conf_path()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<config dir>/loreread/config.lua".to_string()),
+                .unwrap_or_else(|| "<config dir>/lorebird/config.lua".to_string()),
         )));
     }
 

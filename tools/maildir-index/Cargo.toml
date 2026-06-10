@@ -8,6 +8,6 @@ name = "maildir-index"
 path = "src/main.rs"
 
 [dependencies]
-loreread-core = { path = "../../crates/loreread-core" }
+lorebird-core = { path = "../../crates/lorebird-core" }
 rusqlite = { version = "0.39", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }

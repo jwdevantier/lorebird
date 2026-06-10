@@ -1,10 +1,10 @@
 [package]
-name = "loreread"
+name = "lorebird"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "loreread"
+name = "lorebird"
 path = "src/main.rs"
 
 [build-dependencies]
@@ -19,6 +19,6 @@ gdk4 = "0.11"
 glib = { version = "0.22", features = ["v2_74"] }
 gio = "0.22"
 sourceview5 = "0.11"
-loreread-core = { path = "../loreread-core" }
-loreread-lua = { path = "../loreread-lua" }
+lorebird-core = { path = "../lorebird-core" }
+lorebird-lua = { path = "../lorebird-lua" }
 rusqlite = { version = "0.39", features = ["bundled"] }

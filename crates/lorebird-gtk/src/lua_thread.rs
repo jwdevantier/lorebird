@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use loreread_lua::{ComposeMail, LoadedConfig, ParentMail, ResolvedProfile, Vm};
+use lorebird_lua::{ComposeMail, LoadedConfig, ParentMail, ResolvedProfile, Vm};
 
 // ── Command protocol (main → Lua thread) ────────────────────────────
 
@@ -110,14 +110,14 @@ pub struct LuaThread {
 impl LuaThread {
     /// Spawn the Lua thread.  It creates the VM, loads config, and
     /// sends `InitDone` (or `InitFailed`) back via the result channel.
-    pub fn spawn(loreread_conf_path: Option<PathBuf>) -> Self {
+    pub fn spawn(lorebird_conf_path: Option<PathBuf>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<LuaCommand>();
         let (result_tx, result_rx) = mpsc::channel::<LuaResult>();
 
         std::thread::Builder::new()
-            .name("loreread-lua".into())
+            .name("lorebird-lua".into())
             .spawn(move || {
-                lua_thread_main(loreread_conf_path, cmd_rx, result_tx);
+                lua_thread_main(lorebird_conf_path, cmd_rx, result_tx);
             })
             .expect("failed to spawn Lua thread");
 
@@ -154,14 +154,14 @@ impl LuaThread {
 // ── Lua thread main loop ───────────────────────────────────────────
 
 fn lua_thread_main(
-    loreread_conf_path: Option<PathBuf>,
+    lorebird_conf_path: Option<PathBuf>,
     cmd_rx: mpsc::Receiver<LuaCommand>,
     result_tx: mpsc::Sender<LuaResult>,
 ) {
     // 1. Create VM and load config (entirely within this thread)
-    let state = match load_config(loreread_conf_path) {
+    let state = match load_config(lorebird_conf_path) {
         Ok(state) => {
-            eprintln!("[loreread-lua] loaded {} profile(s)", state.profiles.len());
+            eprintln!("[lorebird-lua] loaded {} profile(s)", state.profiles.len());
             let profiles = state.profiles.clone();
             let theme = state.config.config.theme.clone();
             let ui_scale = state.config.config.ui_scale;
@@ -171,7 +171,7 @@ fn lua_thread_main(
             state
         }
         Err(e) => {
-            eprintln!("[loreread-lua] config load failed: {}", e);
+            eprintln!("[lorebird-lua] config load failed: {}", e);
             let _ = result_tx.send(LuaResult::InitFailed { error: e });
             let vm = Vm::new().expect("failed to create Lua VM");
             LuaState {
@@ -187,18 +187,18 @@ fn lua_thread_main(
         match cmd_rx.recv() {
             Ok(LuaCommand::Fetch { profile_label, maildir }) => {
                 eprintln!(
-                    "[loreread-lua] Fetch: profile='{}' maildir='{}'",
+                    "[lorebird-lua] Fetch: profile='{}' maildir='{}'",
                     profile_label,
                     maildir.display()
                 );
                 let t = std::time::Instant::now();
                 let result = handle_fetch(&state, &profile_label, &maildir);
-                eprintln!("[loreread-lua] Fetch complete in {:?}", t.elapsed());
+                eprintln!("[lorebird-lua] Fetch complete in {:?}", t.elapsed());
                 let _ = result_tx.send(result);
             }
             Ok(LuaCommand::Reply { profile_label, parent, mail }) => {
                 eprintln!(
-                    "[loreread-lua] Reply: profile='{}'",
+                    "[lorebird-lua] Reply: profile='{}'",
                     profile_label
                 );
                 let result = handle_reply(&state, &profile_label, &parent, &mail);
@@ -206,14 +206,14 @@ fn lua_thread_main(
             }
             Ok(LuaCommand::Send { profile_label, mail }) => {
                 eprintln!(
-                    "[loreread-lua] Send: profile='{}'",
+                    "[lorebird-lua] Send: profile='{}'",
                     profile_label
                 );
                 let result = handle_send(&state, &profile_label, &mail);
                 let _ = result_tx.send(result);
             }
             Ok(LuaCommand::Shutdown) | Err(_) => {
-                eprintln!("[loreread-lua] thread shutting down");
+                eprintln!("[lorebird-lua] thread shutting down");
                 return;
             }
         }
@@ -222,15 +222,15 @@ fn lua_thread_main(
 
 /// Load config inside the Lua thread.  Returns `LuaState`.
 fn load_config(
-    loreread_conf_path: Option<PathBuf>,
+    lorebird_conf_path: Option<PathBuf>,
 ) -> Result<LuaState, String> {
     let vm = Vm::new().map_err(|e| format!("failed to create Lua VM: {}", e))?;
 
-    let loaded = match loreread_conf_path {
+    let loaded = match lorebird_conf_path {
         Some(ref path) => vm.load_config_file(path)
             .map_err(|e| format!("failed to load config from {}: {}", path.display(), e))?,
         None => {
-            let default = dirs_for_loreread();
+            let default = dirs_for_lorebird();
             let cfg_file = default.join("config.lua");
             if cfg_file.exists() {
                 vm.load_config_file(&cfg_file)
@@ -256,13 +256,13 @@ fn handle_fetch(
 
     // 2. Call on_fetch hook (if defined)
     if let Some(hooks) = hooks {
-        eprintln!("[loreread-lua]   calling on_fetch for '{}'...", profile_label);
+        eprintln!("[lorebird-lua]   calling on_fetch for '{}'...", profile_label);
         match state.vm.call_on_fetch(profile_label, maildir.to_str().unwrap_or(""), hooks) {
             Ok(true) => {
-                eprintln!("[loreread-lua]   on_fetch returned true — indexing");
+                eprintln!("[lorebird-lua]   on_fetch returned true — indexing");
             }
             Ok(false) => {
-                eprintln!("[loreread-lua]   on_fetch returned false — no new mail");
+                eprintln!("[lorebird-lua]   on_fetch returned false — no new mail");
                 return LuaResult::FetchDone {
                     profile_label: profile_label.to_string(),
                     indexed_count: 0,
@@ -270,7 +270,7 @@ fn handle_fetch(
                 };
             }
             Err(e) => {
-                eprintln!("[loreread-lua]   on_fetch error: {}", e);
+                eprintln!("[lorebird-lua]   on_fetch error: {}", e);
                 return LuaResult::FetchDone {
                     profile_label: profile_label.to_string(),
                     indexed_count: 0,
@@ -280,14 +280,14 @@ fn handle_fetch(
         }
     } else {
         eprintln!(
-            "[loreread-lua]   no on_fetch hook for '{}' — indexing directly",
+            "[lorebird-lua]   no on_fetch hook for '{}' — indexing directly",
             profile_label
         );
     }
 
     // 3. Index the maildir
-    eprintln!("[loreread-lua]   indexing '{}'...", maildir.display());
-    let db_path = maildir.join(".loreread.db");
+    eprintln!("[lorebird-lua]   indexing '{}'...", maildir.display());
+    let db_path = maildir.join(".lorebird.db");
     let conn = match rusqlite::Connection::open(&db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -299,7 +299,7 @@ fn handle_fetch(
         }
     };
 
-    if let Err(e) = loreread_core::schema::init_db(&conn) {
+    if let Err(e) = lorebird_core::schema::init_db(&conn) {
         return LuaResult::FetchDone {
             profile_label: profile_label.to_string(),
             indexed_count: 0,
@@ -310,9 +310,9 @@ fn handle_fetch(
     // Enable WAL for concurrent readers
     let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
 
-    match loreread_core::indexer::index_maildir(&conn, maildir) {
+    match lorebird_core::indexer::index_maildir(&conn, maildir) {
         Ok(n) => {
-            eprintln!("[loreread-lua]   indexed {} message(s)", n);
+            eprintln!("[lorebird-lua]   indexed {} message(s)", n);
             LuaResult::FetchDone {
                 profile_label: profile_label.to_string(),
                 indexed_count: n,
@@ -328,7 +328,7 @@ fn handle_fetch(
 }
 
 fn empty_config() -> LoadedConfig {
-    use loreread_lua::{AppConfig, GlobalHooks};
+    use lorebird_lua::{AppConfig, GlobalHooks};
     LoadedConfig {
         config: AppConfig { user: None, theme: "light".to_string(), ui_scale: 1.0, profiles: HashMap::new() },
         profile_hooks: HashMap::new(),
@@ -336,9 +336,9 @@ fn empty_config() -> LoadedConfig {
     }
 }
 
-fn dirs_for_loreread() -> PathBuf {
-    loreread_core::config_dir::loreread_confdir()
-        .unwrap_or_else(|| PathBuf::from("/tmp/loreread"))
+fn dirs_for_lorebird() -> PathBuf {
+    lorebird_core::config_dir::lorebird_confdir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/lorebird"))
 }
 
 /// Handle a Reply command: call on_reply hook if present.
@@ -355,7 +355,7 @@ fn handle_reply(
     let func = match state.config.global_hooks.on_reply.as_ref() {
         Some(f) => f,
         None => {
-            eprintln!("[loreread-lua]   no on_reply hook — using default");
+            eprintln!("[lorebird-lua]   no on_reply hook — using default");
             return LuaResult::ReplyDone {
                 mail: None,
                 error: None,
@@ -363,17 +363,17 @@ fn handle_reply(
         }
     };
 
-    eprintln!("[loreread-lua]   calling on_reply for '{}'...", profile_label);
+    eprintln!("[lorebird-lua]   calling on_reply for '{}'...", profile_label);
     match state.vm.call_on_reply(func, profile_label, parent, mail) {
         Ok(modified) => {
-            eprintln!("[loreread-lua]   on_reply returned modified mail");
+            eprintln!("[lorebird-lua]   on_reply returned modified mail");
             LuaResult::ReplyDone {
                 mail: Some(modified),
                 error: None,
             }
         }
         Err(e) => {
-            eprintln!("[loreread-lua]   on_reply error: {}", e);
+            eprintln!("[lorebird-lua]   on_reply error: {}", e);
             LuaResult::ReplyDone {
                 mail: None,
                 error: Some(format!("on_reply hook failed: {}", e)),
@@ -388,33 +388,33 @@ fn handle_reply(
 /// It can use `send_smtp()` for built-in SMTP, or `sh()` to pipe
 /// to an external MTA. `on_send` is always required — there is no
 /// automatic send path. The hook receives the profile's SMTP config
-/// via the `_loreread_smtp` Lua global so that `send_smtp()` works.
+/// via the `_lorebird_smtp` Lua global so that `send_smtp()` works.
 fn handle_send(
     state: &LuaState,
     profile_label: &str,
     mail: &ComposeMail,
 ) -> LuaResult {
-    // Look up the profile's resolved SMTP config (for _loreread_smtp global)
+    // Look up the profile's resolved SMTP config (for _lorebird_smtp global)
     let smtp = state.profiles.get(profile_label).and_then(|p| p.smtp.as_ref());
 
     let func = match state.config.global_hooks.on_send.as_ref() {
         Some(f) => f,
         None => {
-            eprintln!("[loreread-lua]   no on_send hook");
+            eprintln!("[lorebird-lua]   no on_send hook");
             return LuaResult::SendDone {
                 error: Some("no on_send hook — define on_send in your config".to_string()),
             };
         }
     };
 
-    eprintln!("[loreread-lua]   calling on_send for '{}'...", profile_label);
+    eprintln!("[lorebird-lua]   calling on_send for '{}'...", profile_label);
     match state.vm.call_on_send(func, profile_label, mail, smtp) {
         Ok(()) => {
-            eprintln!("[loreread-lua]   on_send completed");
+            eprintln!("[lorebird-lua]   on_send completed");
             LuaResult::SendDone { error: None }
         }
         Err(e) => {
-            eprintln!("[loreread-lua]   on_send error: {}", e);
+            eprintln!("[lorebird-lua]   on_send error: {}", e);
             LuaResult::SendDone {
                 error: Some(format!("on_send hook failed: {}", e)),
             }
