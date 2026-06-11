@@ -53,49 +53,123 @@ impl Vm {
 
     /// Register lorebird API functions as Lua globals.
     fn register_helpers(&self) -> LuaResult<()> {
-        // ── sh(cmd) → { ok, exit_code, stdout, stderr } ────────
-        let sh_fn = self.lua.create_function(|lua, args: Table| {
-            let cmd_args: Vec<String> = args
-                .sequence_values::<String>()
-                .collect::<Result<Vec<_>, _>>()?;
+        // ── sh(cmd [, opts]) → { ok, exit_code, stdout, stderr } ──
+        //
+        //   cmd:   table of strings  {"prog", "arg1", ...}
+        //   opts:  optional table with keys:
+        //       stdin       – string, piped to child's stdin
+        //       stdin_file  – string path, file piped to child's stdin
+        //       env         – table of extra environment variables
+        //
+        //   stdin takes priority over stdin_file if both are given.
+        //
+        let sh_fn = self.lua.create_function(
+            |lua, (args, opts): (Table, Option<Table>)| {
+                let cmd_args: Vec<String> = args
+                    .sequence_values::<String>()
+                    .collect::<Result<Vec<_>, _>>()?;
 
-            if cmd_args.is_empty() {
-                let err_table = lua.create_table()?;
-                err_table.set("ok", false)?;
-                err_table.set("exit_code", -1)?;
-                err_table.set("stdout", String::new())?;
-                err_table.set("stderr", "sh: empty command".to_string())?;
-                return Ok(err_table);
-            }
+                // Extract optional parameters from opts table
+                let stdin_data: Option<String> = opts
+                    .as_ref()
+                    .and_then(|t| t.get::<Option<String>>("stdin").ok().flatten());
+                let stdin_file: Option<String> = opts
+                    .as_ref()
+                    .and_then(|t| t.get::<Option<String>>("stdin_file").ok().flatten());
+                let env_table: Option<Table> = opts
+                    .as_ref()
+                    .and_then(|t| t.get::<Option<Table>>("env").ok().flatten());
 
-            let output = match std::process::Command::new(&cmd_args[0])
-                .args(&cmd_args[1..])
-                .output()
-            {
-                Ok(o) => o,
-                Err(e) => {
+                if cmd_args.is_empty() {
                     let err_table = lua.create_table()?;
                     err_table.set("ok", false)?;
                     err_table.set("exit_code", -1)?;
                     err_table.set("stdout", String::new())?;
-                    err_table.set("stderr", format!("sh: {}", e))?;
+                    err_table.set("stderr", "sh: empty command".to_string())?;
                     return Ok(err_table);
                 }
-            };
 
-            let result = lua.create_table()?;
-            result.set("ok", output.status.success())?;
-            result.set("exit_code", output.status.code().unwrap_or(-1))?;
-            result.set(
-                "stdout",
-                String::from_utf8_lossy(&output.stdout).to_string(),
-            )?;
-            result.set(
-                "stderr",
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            )?;
-            Ok(result)
-        })?;
+                let mut cmd = std::process::Command::new(&cmd_args[0]);
+                cmd.args(&cmd_args[1..]);
+
+                // Apply extra environment variables (inherited + overrides)
+                if let Some(env_tbl) = &env_table {
+                    for pair in env_tbl.pairs::<String, String>() {
+                        let (key, value) = pair?;
+                        cmd.env(key, value);
+                    }
+                }
+
+                // Decide stdin mode
+                //   stdin (string) > stdin_file (path) > inherit (default)
+                if stdin_data.is_some() {
+                    cmd.stdin(std::process::Stdio::piped());
+                } else if let Some(ref path) = stdin_file {
+                    let file = match std::fs::File::open(path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let err_table = lua.create_table()?;
+                            err_table.set("ok", false)?;
+                            err_table.set("exit_code", -1)?;
+                            err_table.set("stdout", String::new())?;
+                            err_table.set("stderr", format!("sh: cannot open stdin_file '{}': {}", path, e))?;
+                            return Ok(err_table);
+                        }
+                    };
+                    cmd.stdin(std::process::Stdio::from(file));
+                }
+
+                // Capture stdout + stderr
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+
+                let output = match cmd.spawn() {
+                    Ok(mut child) => {
+                        // Write stdin data if provided
+                        if let Some(ref data) = stdin_data {
+                            use std::io::Write;
+                            if let Some(mut pipe) = child.stdin.take() {
+                                let _ = pipe.write_all(data.as_bytes());
+                                // Drop pipe to send EOF
+                                drop(pipe);
+                            }
+                        }
+                        match child.wait_with_output() {
+                            Ok(o) => o,
+                            Err(e) => {
+                                let err_table = lua.create_table()?;
+                                err_table.set("ok", false)?;
+                                err_table.set("exit_code", -1)?;
+                                err_table.set("stdout", String::new())?;
+                                err_table.set("stderr", format!("sh: {}", e))?;
+                                return Ok(err_table);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err_table = lua.create_table()?;
+                        err_table.set("ok", false)?;
+                        err_table.set("exit_code", -1)?;
+                        err_table.set("stdout", String::new())?;
+                        err_table.set("stderr", format!("sh: {}", e))?;
+                        return Ok(err_table);
+                    }
+                };
+
+                let result = lua.create_table()?;
+                result.set("ok", output.status.success())?;
+                result.set("exit_code", output.status.code().unwrap_or(-1))?;
+                result.set(
+                    "stdout",
+                    String::from_utf8_lossy(&output.stdout).to_string(),
+                )?;
+                result.set(
+                    "stderr",
+                    String::from_utf8_lossy(&output.stderr).to_string(),
+                )?;
+                Ok(result)
+            },
+        )?;
 
         self.lua.globals().set("sh", sh_fn)?;
 
@@ -744,6 +818,7 @@ config = {
         assert!(result.get::<String>("stdout").unwrap().contains("hello"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn sh_helper_captures_error() {
         let vm = Vm::new().unwrap();
@@ -766,6 +841,210 @@ config = {
             .unwrap();
         assert_eq!(result.get::<bool>("ok").unwrap(), false);
         assert_eq!(result.get::<i64>("exit_code").unwrap(), -1);
+    }
+
+    // ── sh() tests with platform-specific commands ──────────────
+    // cat, sh -c, echo $VAR are Unix-only. On Windows we use
+    // cmd /C equivalents. The stdin/stdin_file/env features
+    // themselves are cross-platform; only the test fixtures differ.
+
+    #[cfg(unix)]
+    #[test]
+    fn sh_helper_stdin_string() {
+        let vm = Vm::new().unwrap();
+        let result: Table = vm
+            .lua
+            .load(r#"return sh({"cat"}, { stdin = "hello from stdin" })"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+        assert_eq!(result.get::<String>("stdout").unwrap(), "hello from stdin");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sh_helper_stdin_string() {
+        let vm = Vm::new().unwrap();
+        // cmd /C more reads from stdin and writes to stdout
+        let result: Table = vm
+            .lua
+            .load(r#"return sh({"cmd", "/C", "more"}, { stdin = "hello from stdin" })"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        assert!(result.get::<String>("stdout").unwrap().contains("hello from stdin"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sh_helper_stdin_string_multiline() {
+        let vm = Vm::new().unwrap();
+        let lua_code = r#"
+            local body = "Subject: test\n\nHello world\n"
+            return sh({"cat"}, { stdin = body })
+        "#;
+        let result: Table = vm.lua.load(lua_code).eval().unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        let stdout = result.get::<String>("stdout").unwrap();
+        assert!(stdout.contains("Subject: test"));
+        assert!(stdout.contains("Hello world"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sh_helper_stdin_string_multiline() {
+        let vm = Vm::new().unwrap();
+        let lua_code = r#"
+            local body = "Subject: test\n\nHello world\n"
+            return sh({"cmd", "/C", "more"}, { stdin = body })
+        "#;
+        let result: Table = vm.lua.load(lua_code).eval().unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        let stdout = result.get::<String>("stdout").unwrap();
+        assert!(stdout.contains("Subject: test"));
+        assert!(stdout.contains("Hello world"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sh_helper_stdin_file() {
+        let vm = Vm::new().unwrap();
+        let tmp = std::env::temp_dir().join("lorebird_test_stdin_file.txt");
+        std::fs::write(&tmp, "piped from file").unwrap();
+        let lua_code = format!(
+            r#"return sh({{"cat"}}, {{ stdin_file = "{}" }})"#,
+            tmp.display()
+        );
+        let result: Table = vm.lua.load(&lua_code).eval().unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        assert_eq!(result.get::<String>("stdout").unwrap(), "piped from file");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sh_helper_stdin_file() {
+        let vm = Vm::new().unwrap();
+        let tmp = std::env::temp_dir().join("lorebird_test_stdin_file.txt");
+        std::fs::write(&tmp, "piped from file").unwrap();
+        let lua_code = format!(
+            r#"return sh({{"cmd", "/C", "more"}}, {{ stdin_file = "{}" }})"#,
+            tmp.display()
+        );
+        let result: Table = vm.lua.load(&lua_code).eval().unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        assert!(result.get::<String>("stdout").unwrap().contains("piped from file"));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn sh_helper_stdin_file_not_found() {
+        let vm = Vm::new().unwrap();
+        // This test doesn't actually run the child command —
+        // the error happens before spawning, so the command doesn't matter.
+        let result: Table = vm
+            .lua
+            .load(r#"return sh({"cat"}, { stdin_file = "/nonexistent/path/to/file.txt" })"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), false);
+        let stderr = result.get::<String>("stderr").unwrap();
+        assert!(stderr.contains("cannot open stdin_file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sh_helper_stdin_overrides_stdin_file() {
+        let vm = Vm::new().unwrap();
+        let tmp = std::env::temp_dir().join("lorebird_test_stdin_priority.txt");
+        std::fs::write(&tmp, "from file").unwrap();
+        let lua_code = format!(
+            r#"return sh({{"cat"}}, {{ stdin = "from string", stdin_file = "{}" }})"#,
+            tmp.display()
+        );
+        let result: Table = vm.lua.load(&lua_code).eval().unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        assert_eq!(result.get::<String>("stdout").unwrap(), "from string");
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sh_helper_stdin_overrides_stdin_file() {
+        let vm = Vm::new().unwrap();
+        let tmp = std::env::temp_dir().join("lorebird_test_stdin_priority.txt");
+        std::fs::write(&tmp, "from file").unwrap();
+        let lua_code = format!(
+            r#"return sh({{"cmd", "/C", "more"}}, {{ stdin = "from string", stdin_file = "{}" }})"#,
+            tmp.display()
+        );
+        let result: Table = vm.lua.load(&lua_code).eval().unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        assert!(result.get::<String>("stdout").unwrap().contains("from string"));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sh_helper_env_variables() {
+        let vm = Vm::new().unwrap();
+        let result: Table = vm
+            .lua
+            .load(r#"
+                return sh({"sh", "-c", "echo $LOREBIRD_TEST_VAR"}, { env = { LOREBIRD_TEST_VAR = "hello_env" } })
+            "#)
+            .eval()
+            .unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        let stdout = result.get::<String>("stdout").unwrap();
+        assert!(stdout.contains("hello_env"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sh_helper_env_variables() {
+        let vm = Vm::new().unwrap();
+        // cmd /C echo %VAR% expands env vars
+        let result: Table = vm
+            .lua
+            .load(r#"
+                return sh({"cmd", "/C", "echo", "%LOREBIRD_TEST_VAR%"}, { env = { LOREBIRD_TEST_VAR = "hello_env" } })
+            "#)
+            .eval()
+            .unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        let stdout = result.get::<String>("stdout").unwrap();
+        assert!(stdout.contains("hello_env"));
+    }
+
+    #[test]
+    fn sh_helper_no_opts_backward_compat() {
+        let vm = Vm::new().unwrap();
+        // Calling sh() without opts should still work as before
+        let result: Table = vm
+            .lua
+            .load(r#"return sh({"echo", "backward_compat"})"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        assert!(result.get::<String>("stdout").unwrap().contains("backward_compat"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sh_helper_stdin_with_gpg_signing_pattern() {
+        // Simulates the PGP signing pattern from idea_pgp_signing.md:
+        //   local sig = sh({"cat"}, { stdin = mail.body_text })
+        let vm = Vm::new().unwrap();
+        let lua_code = r#"
+            local mail_body = "Looks good.\n"
+            local result = sh({"cat"}, { stdin = mail_body })
+            return result
+        "#;
+        let result: Table = vm.lua.load(lua_code).eval().unwrap();
+        assert_eq!(result.get::<bool>("ok").unwrap(), true);
+        assert_eq!(result.get::<String>("stdout").unwrap(), "Looks good.\n");
     }
 
     #[test]
