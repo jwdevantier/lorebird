@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="crates/loreread-gtk/resources/org.loreread.app.256.png" alt="LoreBird" width="256">
+  <img src="crates/lorebird-gtk/resources/org.lorebird.app.256.png" alt="LoreBird" width="256">
 
 # LoreBird
 
