@@ -2,6 +2,7 @@
 name = "lorebird-sendmail"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "Send email via SMTP (built on lettre)"
 
 [dependencies]

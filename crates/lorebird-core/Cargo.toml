@@ -2,6 +2,7 @@
 name = "lorebird-core"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 rusqlite = { version = "0.39", features = ["bundled"] }

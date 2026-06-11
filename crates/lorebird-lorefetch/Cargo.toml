@@ -2,6 +2,7 @@
 name = "lorebird-lorefetch"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "Fetch mailing-list threads from lore.kernel.org into a maildir"
 
 [dependencies]
