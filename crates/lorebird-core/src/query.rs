@@ -570,6 +570,36 @@ mod tests {
     }
 
     #[test]
+    fn operators_case_insensitive() {
+        // AND / and / And all work
+        let q_and = parse_query("hello AND world").unwrap();
+        let q_and_lower = parse_query("hello and world").unwrap();
+        let q_and_mixed = parse_query("hello And world").unwrap();
+        assert_eq!(q_and, q_and_lower);
+        assert_eq!(q_and, q_and_mixed);
+
+        // OR / or / Or all work
+        let q_or = parse_query("hello OR world").unwrap();
+        let q_or_lower = parse_query("hello or world").unwrap();
+        assert_eq!(q_or, q_or_lower);
+
+        // NOT / not / Not all work
+        let q_not = parse_query("NOT hello").unwrap();
+        let q_not_lower = parse_query("not hello").unwrap();
+        let q_not_mixed = parse_query("Not hello").unwrap();
+        assert_eq!(q_not, q_not_lower);
+        assert_eq!(q_not, q_not_mixed);
+    }
+
+    #[test]
+    fn reject_bare_keyword_lowercase() {
+        // Lowercase keywords are also rejected as bare words
+        assert!(parse_query("and").is_err());
+        assert!(parse_query("or").is_err());
+        assert!(parse_query("not").is_err());
+    }
+
+    #[test]
     fn trailing_junk_is_error() {
         // implicit AND not supported (yet); extra tokens are an error
         assert!(parse_query("hello world").is_err());
