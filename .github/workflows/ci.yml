@@ -26,7 +26,7 @@ jobs:
         run: cargo test --workspace
 
   # ── Windows ─────────────────────────────────────────────────────────
-  build-windows:
+  test-windows:
     runs-on: windows-latest
     defaults:
       run:
@@ -72,7 +72,7 @@ jobs:
           path: dist/lorebird/
 
   # ── macOS via Nix flake ──────────────────────────────────────────────
-  build-mac-nix:
+  test-mac-nix:
     runs-on: macos-14  # Apple Silicon
     steps:
       - uses: actions/checkout@v4
@@ -93,7 +93,7 @@ jobs:
         run: nix develop --command cargo test --workspace
 
   # ── macOS via Homebrew ───────────────────────────────────────────────
-  build-mac-brew:
+  test-mac-brew:
     runs-on: macos-14  # Apple Silicon
     steps:
       - uses: actions/checkout@v4
