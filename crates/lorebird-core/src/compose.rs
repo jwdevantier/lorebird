@@ -60,8 +60,13 @@ impl Mail {
     /// - `body_text` = quoted parent body with attribution line
     pub fn new_reply(parent: &Mail, profile_name: &str, profile_email: &str) -> Self {
         let from = format!("{} <{}>", profile_name, profile_email);
-        let to = add_self_to_addrs(&parent.to, profile_name, profile_email);
-        let cc = remove_self_from_addrs(&parent.cc, profile_email);
+
+        // To = parent's From (the person we're replying to)
+        let to = parent.from.clone();
+
+        // Cc = parent's To + parent's Cc, minus ourselves and the sender
+        // (who is already in To), deduplicated.
+        let cc = merge_and_dedup(&parent.to, &parent.cc, profile_email, &parent.from);
 
         // Subject: prepend "Re: " unless it already starts with it (case-insensitive).
         let subject = if parent.subject.to_lowercase().starts_with("re:") {
@@ -261,48 +266,42 @@ fn format_reply_body(body: &str, date: &str, from: &str) -> String {
     out
 }
 
-/// Add our own address to a comma-separated RFC 2822 address list
-/// if not already present.
+/// Merge two comma-separated address lists, remove our own address
+/// and the sender (who is already in To), and deduplicate by bare email.
 ///
-/// Addresses are `"Name <email>"` or bare `email`, separated
-/// by `", "`.  We detect ourselves by email substring matching.
-fn add_self_to_addrs(addrs: &str, name: &str, email: &str) -> String {
-    if addr_list_contains(addrs, email) {
-        addrs.to_string()
-    } else if addrs.is_empty() {
-        format!("{} <{}>", name, email)
-    } else {
-        format!("{}, {} <{}>", addrs, name, email)
+/// Used to compute the Cc of a reply:
+///   Cc = (parent.to + parent.cc) − self − parent.from
+fn merge_and_dedup(to: &str, cc: &str, self_email: &str, sender: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+
+    // Seed the dedup set with the sender's email so they don't appear
+    // in Cc (they're already in To).
+    seen.insert(extract_email_from_from(sender).to_lowercase());
+
+    // Collect entries from both lists in order
+    let entries: Vec<&str> = to.split(", ").chain(cc.split(", ")).collect();
+
+    for entry in entries {
+        if entry.is_empty() {
+            continue;
+        }
+        // Skip ourselves
+        if entry.contains(self_email) {
+            continue;
+        }
+        // Deduplicate by bare email
+        let email = extract_email_from_from(entry).to_lowercase();
+        if seen.insert(email) {
+            result.push(entry.to_string());
+        }
     }
+
+    result.join(", ")
 }
 
 /// Remove our own address from a comma-separated RFC 2822 address list.
 ///
-/// Splits on `", "`, removes any entry containing our email (matching
-/// both `alice@example.com` and `Alice <alice@example.com>`), and
-/// re-joins with `", "`.
-fn remove_self_from_addrs(addrs: &str, email: &str) -> String {
-    if addrs.is_empty() || !addr_list_contains(addrs, email) {
-        return addrs.to_string();
-    }
-    let filtered: Vec<&str> = addrs
-        .split(", ")
-        .filter(|entry| !entry.contains(email))
-        .collect();
-    filtered.join(", ")
-}
-
-/// Check whether a comma-separated RFC 2822 address list contains the
-/// given bare email.
-///
-/// Matches both `alice@example.com` and `Alice <alice@example.com>`
-/// by testing substring containment on each comma-separated entry.
-fn addr_list_contains(addrs: &str, email: &str) -> bool {
-    addrs
-        .split(", ")
-        .any(|entry| entry.contains(email))
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -331,10 +330,10 @@ mod tests {
         let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
 
         assert_eq!(mail.from, "Riccardo <riccardo@defmacro.it>");
-        // To = parent.to + self (self not in parent.to)
-        assert_eq!(mail.to, "list@example.com, Riccardo <riccardo@defmacro.it>");
-        // Cc copied from parent, self not in parent.cc so unchanged
-        assert_eq!(mail.cc, "bob@example.com, carol@example.com");
+        // To = parent.from (the person we're replying to)
+        assert_eq!(mail.to, "Alice <alice@example.com>");
+        // Cc = parent.to + parent.cc, minus self, deduped
+        assert_eq!(mail.cc, "list@example.com, bob@example.com, carol@example.com");
         assert_eq!(mail.bcc, "");
         assert_eq!(mail.subject, "Re: [PATCH v2] Fix memory leak");
         assert!(mail.date.is_none()); // generated at send time
@@ -352,14 +351,18 @@ mod tests {
     }
 
     #[test]
-    fn new_reply_self_already_in_to() {
+    fn new_reply_sender_in_to_not_cc() {
+        // If the original sender is also in parent.to, they become To
+        // and are deduplicated from Cc.
         let parent = Mail {
-            to: "list@example.com, riccardo@defmacro.it".to_string(),
+            to: "list@example.com, alice@example.com".to_string(),
             ..make_parent()
         };
         let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
-        // Self already present — To unchanged
-        assert_eq!(mail.to, "list@example.com, riccardo@defmacro.it");
+        // To = parent.from (Alice)
+        assert_eq!(mail.to, "Alice <alice@example.com>");
+        // Cc = parent.to (minus Alice who's already in To) + parent.cc
+        assert_eq!(mail.cc, "list@example.com, bob@example.com, carol@example.com");
     }
 
     #[test]
@@ -369,8 +372,8 @@ mod tests {
             ..make_parent()
         };
         let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
-        // Cc has self removed
-        assert_eq!(mail.cc, "bob@example.com");
+        // Self removed from Cc, parent.to (list) merged in
+        assert_eq!(mail.cc, "list@example.com, bob@example.com");
     }
 
     #[test]
@@ -381,27 +384,31 @@ mod tests {
         };
         let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
         // The whole "Riccardo Maffulli <riccardo@defmacro.it>" entry is removed
-        assert_eq!(mail.cc, "bob@example.com");
+        assert_eq!(mail.cc, "list@example.com, bob@example.com");
     }
 
     #[test]
-    fn new_reply_empty_to_adds_self() {
+    fn new_reply_empty_to_sender_becomes_to() {
+        // Even with empty To, sender goes to To and nothing in Cc
         let parent = Mail {
             to: String::new(),
             ..make_parent()
         };
         let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
-        assert_eq!(mail.to, "Riccardo <riccardo@defmacro.it>");
+        assert_eq!(mail.to, "Alice <alice@example.com>");
+        // Cc = parent.cc (no parent.to to merge in)
+        assert_eq!(mail.cc, "bob@example.com, carol@example.com");
     }
 
     #[test]
-    fn new_reply_empty_cc_stays_empty() {
+    fn new_reply_empty_cc_stays_merged() {
         let parent = Mail {
             cc: String::new(),
             ..make_parent()
         };
         let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
-        assert_eq!(mail.cc, "");
+        // Cc = parent.to (merged in even though cc is empty)
+        assert_eq!(mail.cc, "list@example.com");
     }
 
     #[test]

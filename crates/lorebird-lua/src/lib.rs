@@ -1157,8 +1157,8 @@ config = {
         assert_eq!(result.cc, "added-by-hook@example.com");
         assert_eq!(
             result.to,
-            "list@example.com, Riccardo <riccardo@defmacro.it>"
-        ); // unchanged by hook
+            "Alice <alice@example.com>"
+        ); // To = parent.from
     }
 
     #[test]
