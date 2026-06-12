@@ -33,6 +33,8 @@ you type your query.
 - [Building/Installing LoreBird](./docs/installing.md)
 - [Configuring LoreBird](./docs/config.md)
 - [The Lua API](./docs/lua_api.md)
+- [Query Language](./docs/query-language.md)
+  - how to filter the threads shown in the mailbox
 
 # License
 
