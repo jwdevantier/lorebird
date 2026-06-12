@@ -1,7 +1,7 @@
 //! Compose window — email editor with header fields and SourceView body.
 //!
 //! Opens a secondary GTK window with editable From/To/Cc/Bcc/Subject
-//! entries and a SourceView body editor pre-filled from a `ComposeMail`.
+//! entries and a SourceView body editor pre-filled from a `Mail`.
 //! The Send button dispatches `on_send` via the Lua thread.
 
 use std::cell::RefCell;
@@ -16,7 +16,7 @@ use gtk4::{
 use sourceview5 as sv;
 use sourceview5::prelude::*;
 
-use lorebird_core::compose::ComposeMail;
+use lorebird_core::compose::Mail;
 
 use crate::app_state::AppState;
 use crate::lua_thread::LuaCommand;
@@ -29,7 +29,7 @@ pub struct ComposeContext {
     /// The profile label (for on_send).
     pub profile_label: String,
     /// The pre-filled mail data (possibly modified by on_reply).
-    pub mail: ComposeMail,
+    pub mail: Mail,
     /// Whether dark theme is active (for SourceView scheme).
     pub is_dark: bool,
 }
@@ -159,7 +159,7 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
         let body_end = body_buffer.end_iter();
         let body_text = body_buffer.text(&body_start, &body_end, false).to_string();
 
-        let final_mail = ComposeMail {
+        let final_mail = Mail {
             from,
             to,
             cc,

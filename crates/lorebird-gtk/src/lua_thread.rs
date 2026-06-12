@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use lorebird_lua::{ComposeMail, LoadedConfig, ParentMail, ResolvedProfile, Vm};
+use lorebird_lua::{LoadedConfig, Mail, ResolvedProfile, Vm};
 
 // ── Command protocol (main → Lua thread) ────────────────────────────
 
@@ -29,14 +29,14 @@ pub enum LuaCommand {
     /// Returns the possibly-modified mail, or None if the hook returned nil.
     Reply {
         profile_label: String,
-        parent: ParentMail,
-        mail: ComposeMail,
+        parent: Mail,
+        mail: Mail,
     },
 
     /// Call `on_send` hook with the composed mail.
     Send {
         profile_label: String,
-        mail: ComposeMail,
+        mail: Mail,
     },
 
     /// Shut down the Lua thread.
@@ -71,7 +71,7 @@ pub enum LuaResult {
     /// Reply hook completed. Carries the possibly-modified mail (or
     /// None if the hook was absent / returned nil).
     ReplyDone {
-        mail: Option<ComposeMail>,
+        mail: Option<Mail>,
         error: Option<String>,
     },
 
@@ -349,8 +349,8 @@ fn dirs_for_lorebird() -> PathBuf {
 fn handle_reply(
     state: &LuaState,
     profile_label: &str,
-    parent: &ParentMail,
-    mail: &ComposeMail,
+    parent: &Mail,
+    mail: &Mail,
 ) -> LuaResult {
     let func = match state.config.global_hooks.on_reply.as_ref() {
         Some(f) => f,
@@ -392,7 +392,7 @@ fn handle_reply(
 fn handle_send(
     state: &LuaState,
     profile_label: &str,
-    mail: &ComposeMail,
+    mail: &Mail,
 ) -> LuaResult {
     // Look up the profile's resolved SMTP config (for _lorebird_smtp global)
     let smtp = state.profiles.get(profile_label).and_then(|p| p.smtp.as_ref());

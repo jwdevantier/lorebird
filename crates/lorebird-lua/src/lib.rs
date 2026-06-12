@@ -11,7 +11,7 @@ pub use config::{
     AppConfig, GlobalHooks, LoadedConfig, ProfileData, ProfileHooks, ResolvedProfile, UserInfo,
     ViewConfig,
 };
-pub use lorebird_core::compose::{ComposeMail, ParentMail};
+pub use lorebird_core::compose::Mail;
 pub use lorebird_sendmail::{SendError, SmtpConfig};
 
 use std::collections::HashMap;
@@ -201,7 +201,7 @@ impl Vm {
         //   Converts a mail table (same structure as passed to on_reply /
         //   on_send) to an RFC 2822 formatted string.
         let mail_to_rfc2822_fn = self.lua.create_function(|_lua, table: Table| {
-            let mail = extract_compose_mail_from_table(&table)?;
+            let mail = extract_mail_from_table(&table)?;
             Ok(mail.to_rfc2822())
         })?;
 
@@ -483,10 +483,10 @@ impl Vm {
         &self,
         func: &mlua::Function,
         profile_label: &str,
-        parent: &ParentMail,
-        mail: &ComposeMail,
-    ) -> LuaResult<ComposeMail> {
-        let parent_table = build_parent_table(&self.lua, parent)?;
+        parent: &Mail,
+        mail: &Mail,
+    ) -> LuaResult<Mail> {
+        let parent_table = build_mail_table(&self.lua, parent)?;
         let mail_table = build_mail_table(&self.lua, mail)?;
 
         // Call the hook; discard the return value.  The user can
@@ -494,7 +494,7 @@ impl Vm {
         // argument after the call.
         let _: mlua::Value = func.call((profile_label, parent_table, &mail_table))?;
 
-        let modified = extract_compose_mail_from_table(&mail_table)?;
+        let modified = extract_mail_from_table(&mail_table)?;
         Ok(modified)
     }
 
@@ -511,7 +511,7 @@ impl Vm {
         &self,
         func: &mlua::Function,
         profile_label: &str,
-        mail: &ComposeMail,
+        mail: &Mail,
         smtp: Option<&SmtpConfig>,
     ) -> LuaResult<()> {
         self.set_smtp_global(smtp)?;
@@ -561,51 +561,22 @@ impl Drop for Vm {
 
 // ── Lua ↔ Rust conversion helpers ─────────────────────────────────────
 
-/// Build a Lua table from a `ParentMail` struct.
-fn build_parent_table(lua: &Lua, parent: &ParentMail) -> LuaResult<Table> {
-    let table = lua.create_table()?;
-    table.set("message_id", parent.message_id.as_deref().unwrap_or(""))?;
-    table.set("from", parent.from.as_str())?;
-    table.set("to", parent.to.as_str())?;
-    table.set("cc", parent.cc.as_str())?;
-    table.set("subject", parent.subject.as_str())?;
-    table.set("date", parent.date.as_str())?;
-    table.set("references", parent.references.as_str())?;
-    table.set("in_reply_to", parent.in_reply_to.as_deref().unwrap_or(""))?;
-    table.set("body_text", parent.body_text.as_str())?;
-
-    // All original headers from the message on disk.
-    let headers = lua.create_table()?;
-    for (k, v) in &parent.headers {
-        headers.set(k.as_str(), v.as_str())?;
-    }
-    table.set("headers", headers)?;
-
-    Ok(table)
-}
-
-/// Build a Lua table from a `ComposeMail` struct.
-fn build_mail_table(lua: &Lua, mail: &ComposeMail) -> LuaResult<Table> {
+/// Build a Lua table from a `Mail` struct.
+///
+/// Used for both the `parent` and `mail` arguments passed to hooks.
+/// `Option<String>` fields are converted to empty strings in Lua
+/// so that hooks never see `nil` for string fields.
+fn build_mail_table(lua: &Lua, mail: &Mail) -> LuaResult<Table> {
     let table = lua.create_table()?;
     table.set("from", mail.from.as_str())?;
     table.set("to", mail.to.as_str())?;
     table.set("cc", mail.cc.as_str())?;
     table.set("bcc", mail.bcc.as_str())?;
     table.set("subject", mail.subject.as_str())?;
-
-    if let Some(ref v) = mail.date {
-        table.set("date", v.as_str())?;
-    }
-    if let Some(ref v) = mail.message_id {
-        table.set("message_id", v.as_str())?;
-    }
-    if let Some(ref v) = mail.in_reply_to {
-        table.set("in_reply_to", v.as_str())?;
-    }
-    if let Some(ref v) = mail.references {
-        table.set("references", v.as_str())?;
-    }
-
+    table.set("date", mail.date.as_deref().unwrap_or(""))?;
+    table.set("message_id", mail.message_id.as_deref().unwrap_or(""))?;
+    table.set("in_reply_to", mail.in_reply_to.as_deref().unwrap_or(""))?;
+    table.set("references", mail.references.as_deref().unwrap_or(""))?;
     table.set("body_text", mail.body_text.as_str())?;
 
     // Headers sub-table
@@ -618,10 +589,10 @@ fn build_mail_table(lua: &Lua, mail: &ComposeMail) -> LuaResult<Table> {
     Ok(table)
 }
 
-/// Extract a `ComposeMail` from a Lua table.
+/// Extract a `Mail` from a Lua table.
 ///
 /// Missing optional fields default to empty strings or None.
-fn extract_compose_mail_from_table(table: &Table) -> LuaResult<ComposeMail> {
+fn extract_mail_from_table(table: &Table) -> LuaResult<Mail> {
     let from: String = table.get("from")?;
     let to: String = table.get("to")?;
     let cc: String = table.get("cc").unwrap_or_default();
@@ -645,7 +616,7 @@ fn extract_compose_mail_from_table(table: &Table) -> LuaResult<ComposeMail> {
         Err(_) => HashMap::new(),
     };
 
-    Ok(ComposeMail {
+    Ok(Mail {
         from,
         to,
         cc,
@@ -1163,19 +1134,20 @@ config = {
         let loaded = vm.load_config_string(code).unwrap();
         let on_reply = loaded.global_hooks.on_reply.as_ref().unwrap();
 
-        let parent = lorebird_core::compose::ParentMail {
-            message_id: Some("<abc@def>".to_string()),
+        let parent = lorebird_core::compose::Mail {
             from: "Alice <alice@example.com>".to_string(),
             to: "list@example.com".to_string(),
             cc: String::new(),
+            bcc: String::new(),
             subject: "Test subject".to_string(),
-            date: "2024-01-15".to_string(),
-            references: String::new(),
+            date: Some("2024-01-15".to_string()),
+            message_id: Some("<abc@def>".to_string()),
             in_reply_to: None,
+            references: None,
             body_text: "Original body".to_string(),
             headers: std::collections::HashMap::new(),
         };
-        let mail = lorebird_core::compose::ComposeMail::new_reply(
+        let mail = lorebird_core::compose::Mail::new_reply(
             &parent,
             "Riccardo",
             "riccardo@defmacro.it",
@@ -1209,20 +1181,21 @@ config = {
         let loaded = vm.load_config_string(code).unwrap();
         let on_reply = loaded.global_hooks.on_reply.as_ref().unwrap();
 
-        let parent = lorebird_core::compose::ParentMail {
-            message_id: Some("<abc@def>".to_string()),
+        let parent = lorebird_core::compose::Mail {
             from: "Alice <alice@example.com>".to_string(),
             to: String::new(),
             cc: String::new(),
+            bcc: String::new(),
             subject: "Hello".to_string(),
-            date: String::new(),
-            references: String::new(),
+            date: None,
+            message_id: Some("<abc@def>".to_string()),
             in_reply_to: None,
+            references: None,
             body_text: String::new(),
             headers: std::collections::HashMap::new(),
         };
         let mail =
-            lorebird_core::compose::ComposeMail::new_reply(&parent, "Bob", "bob@example.com");
+            lorebird_core::compose::Mail::new_reply(&parent, "Bob", "bob@example.com");
 
         // The hook modifies mail.cc in-place; we always get back the
         // (potentially modified) mail, never None.
@@ -1257,7 +1230,7 @@ config = {{
         let loaded = vm.load_config_string(&code).unwrap();
         let on_send = loaded.global_hooks.on_send.as_ref().unwrap();
 
-        let mail = lorebird_core::compose::ComposeMail {
+        let mail = lorebird_core::compose::Mail {
             from: "Alice <alice@example.com>".to_string(),
             to: "Bob <bob@example.com>".to_string(),
             cc: String::new(),

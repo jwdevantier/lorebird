@@ -26,7 +26,7 @@ use crate::compose::{self, ComposeContext};
 use crate::folder_item::FolderItem;
 use crate::lua_thread::LuaCommand;
 use crate::thread_node::ThreadNode;
-use lorebird_core::compose::ComposeMail;
+use lorebird_core::compose::Mail;
 
 // ── Public entry point ─────────────────────────────────────────────
 
@@ -414,7 +414,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
 /// Triggered by Ctrl+R or the context menu Reply button.
 ///
-/// Builds a pre-filled `ComposeMail` from the selected message, calls
+/// Builds a pre-filled `Mail` from the selected message, calls
 /// `on_reply` if the hook exists, and opens the compose window.
 fn trigger_reply(
     state: &Rc<RefCell<AppState>>,
@@ -445,7 +445,7 @@ fn trigger_reply(
         }
     };
 
-    // Build ParentMail from the selected node, including ALL original
+    // Build Mail from the selected node, including ALL original
     // headers read from disk so the on_reply hook can inspect any header.
     let filename = node.filename();
     let maildir = s.active_maildir.borrow().clone();
@@ -455,27 +455,34 @@ fn trigger_reply(
         HashMap::new()
     };
 
-    let parent = lorebird_core::compose::ParentMail {
+    let parent = lorebird_core::compose::Mail {
+        from: node.sender(),
+        to: node.to_addrs(),
+        cc: node.cc_addrs(),
+        bcc: String::new(),
+        subject: node.subject(),
+        date: {
+            let d = node.date_str();
+            if d.is_empty() { None } else { Some(d) }
+        },
         message_id: {
             let mid = node.message_id();
             if mid.is_empty() { None } else { Some(mid) }
         },
-        from: node.sender(),
-        to: node.to_addrs(),
-        cc: node.cc_addrs(),
-        subject: node.subject(),
-        date: node.date_str(),
-        references: node.references_str(),
         in_reply_to: {
             let irt = node.in_reply_to();
             if irt.is_empty() { None } else { Some(irt) }
+        },
+        references: {
+            let r = node.references_str();
+            if r.is_empty() { None } else { Some(r) }
         },
         body_text: node.body_preview(),
         headers,
     };
 
     // Build pre-filled reply
-    let mail = ComposeMail::new_reply(&parent, &profile.name, &profile.email);
+    let mail = Mail::new_reply(&parent, &profile.name, &profile.email);
 
     // If on_reply hook exists, dispatch to the Lua thread and poll for result
     if s.has_on_reply {

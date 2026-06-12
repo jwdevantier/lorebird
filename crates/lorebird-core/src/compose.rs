@@ -1,8 +1,10 @@
-//! Compose-mail logic: pre-filled replies, RFC 2822 serialisation.
+//! Mail data types, reply construction, and RFC 2822 serialisation.
 //!
-//! `ComposeMail` mirrors the Lua `mail` table from the spec and carries
-//! all data needed for the compose window.  `ParentMail` carries the
-//! read-only parent information passed to the `on_reply` hook.
+//! A single `Mail` struct represents both incoming messages (passed as
+//! the `parent` argument to hooks) and messages being composed (the
+//! `mail` argument).  Fields that may be absent use `Option<String>`;
+//! the Lua layer converts `None` to `""` when building tables so that
+//! hooks never see `nil` for string fields.
 //!
 //! See `specs/app_config_and_email_compose.md` for the full design.
 
@@ -10,11 +12,13 @@ use std::collections::HashMap;
 
 // ── Data types ────────────────────────────────────────────────────────
 
-/// A mail being composed (reply or new).
+/// A mail message.
 ///
-/// Fields mirror the Lua `mail` table from the spec.
+/// Used for both the read-only `parent` passed to `on_reply` and the
+/// mutable `mail` passed to `on_reply` / `on_send`.  In Lua, `None`
+/// fields appear as empty strings so hooks never need to nil-check.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ComposeMail {
+pub struct Mail {
     pub from: String,
     pub to: String,
     #[serde(default)]
@@ -25,8 +29,8 @@ pub struct ComposeMail {
     /// RFC 2822 Date header.  `None` means "generate at send time".
     #[serde(default)]
     pub date: Option<String>,
-    /// Message-ID (e.g. `<unique@host>`).  Set by `new_reply()` so
-    /// the hook can reference it; `None` means generate at serialise time.
+    /// Message-ID (e.g. `<unique@host>`).  `None` means generate at
+    /// serialise time.
     #[serde(default)]
     pub message_id: Option<String>,
     #[serde(default)]
@@ -34,37 +38,14 @@ pub struct ComposeMail {
     #[serde(default)]
     pub references: Option<String>,
     pub body_text: String,
-    /// Arbitrary extra headers (e.g. Reply-To).
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-}
-
-/// Parent message data passed to the `on_reply` hook.
-///
-/// Mirrors the `parent` table from the spec.  The `headers` map
-/// carries all significant headers from the original message so that
-/// hooks can inspect `Reply-To`, `List-Post`, `X-Mailer`, etc.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ParentMail {
-    pub message_id: Option<String>,
-    pub from: String,
-    #[serde(default)]
-    pub to: String,
-    #[serde(default)]
-    pub cc: String,
-    pub subject: String,
-    pub date: String,
-    pub references: String,
-    pub in_reply_to: Option<String>,
-    pub body_text: String,
-    /// All significant headers from the original message (name → value).
+    /// Arbitrary extra headers (e.g. Reply-To, X-Mailer).
     #[serde(default)]
     pub headers: HashMap<String, String>,
 }
 
 // ── Reply construction ────────────────────────────────────────────────
 
-impl ComposeMail {
+impl Mail {
     /// Build a pre-filled reply from a parent message and profile.
     ///
     /// Reply-All (mailing-list style):
@@ -77,7 +58,7 @@ impl ComposeMail {
     /// - `date` = `None` (auto-generated at send time)
     /// - `message_id` = freshly generated unique ID
     /// - `body_text` = quoted parent body with attribution line
-    pub fn new_reply(parent: &ParentMail, profile_name: &str, profile_email: &str) -> Self {
+    pub fn new_reply(parent: &Mail, profile_name: &str, profile_email: &str) -> Self {
         let from = format!("{} <{}>", profile_name, profile_email);
         let to = add_self_to_addrs(&parent.to, profile_name, profile_email);
         let cc = remove_self_from_addrs(&parent.cc, profile_email);
@@ -93,8 +74,10 @@ impl ComposeMail {
 
         // References chain: parent's references + parent's message_id.
         let mut refs_parts = Vec::new();
-        if !parent.references.is_empty() {
-            refs_parts.push(parent.references.clone());
+        if let Some(ref refs) = parent.references {
+            if !refs.is_empty() {
+                refs_parts.push(refs.clone());
+            }
         }
         if let Some(ref mid) = parent.message_id {
             refs_parts.push(mid.clone());
@@ -105,9 +88,10 @@ impl ComposeMail {
             Some(refs_parts.join(" "))
         };
 
-        let body_text = format_reply_body(&parent.body_text, &parent.date, &parent.from);
+        let parent_date = parent.date.as_deref().unwrap_or("");
+        let body_text = format_reply_body(&parent.body_text, parent_date, &parent.from);
 
-        ComposeMail {
+        Mail {
             from,
             to,
             cc,
@@ -325,16 +309,17 @@ fn addr_list_contains(addrs: &str, email: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn make_parent() -> ParentMail {
-        ParentMail {
-            message_id: Some("<abc@def>".to_string()),
+    fn make_parent() -> Mail {
+        Mail {
             from: "Alice <alice@example.com>".to_string(),
             to: "list@example.com".to_string(),
             cc: "bob@example.com, carol@example.com".to_string(),
+            bcc: String::new(),
             subject: "[PATCH v2] Fix memory leak".to_string(),
-            date: "2024-01-15T10:30:00+00:00".to_string(),
-            references: "<parent@def> <other@def>".to_string(),
+            date: Some("2024-01-15T10:30:00+00:00".to_string()),
+            message_id: Some("<abc@def>".to_string()),
             in_reply_to: Some("<parent@def>".to_string()),
+            references: Some("<parent@def> <other@def>".to_string()),
             body_text: "This patch fixes...\n".to_string(),
             headers: HashMap::new(),
         }
@@ -343,7 +328,7 @@ mod tests {
     #[test]
     fn new_reply_basic() {
         let parent = make_parent();
-        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
 
         assert_eq!(mail.from, "Riccardo <riccardo@defmacro.it>");
         // To = parent.to + self (self not in parent.to)
@@ -368,74 +353,74 @@ mod tests {
 
     #[test]
     fn new_reply_self_already_in_to() {
-        let parent = ParentMail {
+        let parent = Mail {
             to: "list@example.com, riccardo@defmacro.it".to_string(),
             ..make_parent()
         };
-        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
         // Self already present — To unchanged
         assert_eq!(mail.to, "list@example.com, riccardo@defmacro.it");
     }
 
     #[test]
     fn new_reply_removes_self_from_cc() {
-        let parent = ParentMail {
+        let parent = Mail {
             cc: "riccardo@defmacro.it, bob@example.com".to_string(),
             ..make_parent()
         };
-        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
         // Cc has self removed
         assert_eq!(mail.cc, "bob@example.com");
     }
 
     #[test]
     fn new_reply_removes_self_from_cc_angle_form() {
-        let parent = ParentMail {
+        let parent = Mail {
             cc: "Riccardo Maffulli <riccardo@defmacro.it>, bob@example.com".to_string(),
             ..make_parent()
         };
-        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
         // The whole "Riccardo Maffulli <riccardo@defmacro.it>" entry is removed
         assert_eq!(mail.cc, "bob@example.com");
     }
 
     #[test]
     fn new_reply_empty_to_adds_self() {
-        let parent = ParentMail {
+        let parent = Mail {
             to: String::new(),
             ..make_parent()
         };
-        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
         assert_eq!(mail.to, "Riccardo <riccardo@defmacro.it>");
     }
 
     #[test]
     fn new_reply_empty_cc_stays_empty() {
-        let parent = ParentMail {
+        let parent = Mail {
             cc: String::new(),
             ..make_parent()
         };
-        let mail = ComposeMail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
+        let mail = Mail::new_reply(&parent, "Riccardo", "riccardo@defmacro.it");
         assert_eq!(mail.cc, "");
     }
 
     #[test]
     fn no_double_re_prefix() {
-        let parent = ParentMail {
+        let parent = Mail {
             subject: "Re: Already a reply".to_string(),
             ..make_parent()
         };
-        let mail = ComposeMail::new_reply(&parent, "Bob", "bob@example.com");
+        let mail = Mail::new_reply(&parent, "Bob", "bob@example.com");
         assert_eq!(mail.subject, "Re: Already a reply");
     }
 
     #[test]
     fn case_insensitive_re_detection() {
-        let parent = ParentMail {
+        let parent = Mail {
             subject: "RE: Mixed case".to_string(),
             ..make_parent()
         };
-        let mail = ComposeMail::new_reply(&parent, "Bob", "bob@example.com");
+        let mail = Mail::new_reply(&parent, "Bob", "bob@example.com");
         assert_eq!(mail.subject, "RE: Mixed case");
     }
 
@@ -443,8 +428,8 @@ mod tests {
     fn new_reply_no_message_id() {
         let mut parent = make_parent();
         parent.message_id = None;
-        parent.references = String::new();
-        let mail = ComposeMail::new_reply(&parent, "Bob", "bob@example.com");
+        parent.references = None;
+        let mail = Mail::new_reply(&parent, "Bob", "bob@example.com");
         assert_eq!(mail.in_reply_to, None);
         assert_eq!(mail.references, None);
     }
@@ -469,7 +454,7 @@ mod tests {
 
     #[test]
     fn to_rfc2822_basic() {
-        let mut mail = ComposeMail {
+        let mut mail = Mail {
             from: "Bob <bob@example.com>".to_string(),
             to: "Alice <alice@example.com>".to_string(),
             cc: "list@example.com".to_string(),
@@ -506,7 +491,7 @@ mod tests {
 
     #[test]
     fn to_rfc2822_minimal() {
-        let mail = ComposeMail {
+        let mail = Mail {
             from: "A <a@b>".to_string(),
             to: "C <c@d>".to_string(),
             cc: String::new(),
@@ -534,7 +519,7 @@ mod tests {
 
     #[test]
     fn to_rfc2822_user_overrides_mime_headers() {
-        let mut mail = ComposeMail {
+        let mut mail = Mail {
             from: "A <a@b>".to_string(),
             to: "C <c@d>".to_string(),
             cc: String::new(),
