@@ -19,7 +19,12 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@v17
 
-      - uses: DeterminateSystems/magic-nix-cache-action@v9
+      - name: Cache Nix store
+        uses: actions/cache@v4
+        with:
+          path: /nix/store
+          key: nix-macos-aarch64-${{ hashFiles('flake.lock') }}
+          restore-keys: nix-macos-aarch64-
 
       - name: Build flake package
         run: nix build .#lorebird --print-build-logs
