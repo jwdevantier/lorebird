@@ -57,6 +57,10 @@
 
       packages = forAllSystems ({ pkgs, system }:
         let
+          # The icon directory must be referenced as a separate store path because
+          # buildRustPackage filters the source tree and strips non-Rust files.
+          iconDir = ./crates/lorebird-gtk/resources;
+
           lorebird = pkgs.rustPlatform.buildRustPackage {
             pname = "lorebird";
             version = "0.1.0";
@@ -93,7 +97,7 @@
               # Install icons into the hicolor icon theme
               for size in 16 32 48 64 128 256; do
                 mkdir -p $out/share/icons/hicolor/''${size}x''${size}/apps
-                cp icon/org.lorebird.app.''${size}.png \
+                cp ${iconDir}/org.lorebird.app.''${size}.png \
                   $out/share/icons/hicolor/''${size}x''${size}/apps/org.lorebird.app.png
               done
             '';
