@@ -17,12 +17,12 @@ are documented below so you know which fields exist and what they contain.
 
 ### mail
 
-A **mail table** represents an email being composed.  It is passed to
-`on_reply` (as the third argument, modifiable) and `on_send` (as the second
-argument, modifiable).
+A **mail table** represents an email message.  The same shape is used for
+both the `parent` (read-only, the message you're replying to) and `mail`
+(mutable, the message you're composing) arguments passed to hooks.
 
-You can change any field in-place — the modified table is always what
-Lorebird uses after the hook returns.
+You can change any field on the `mail` argument in-place — the modified
+table is always what Lorebird uses after the hook returns.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -31,17 +31,20 @@ Lorebird uses after the hook returns.
 | `cc` | string | Cc address(es), comma-separated. Defaults to `""` |
 | `bcc` | string | Bcc address(es), comma-separated. Defaults to `""` |
 | `subject` | string | Subject line |
-| `date` | string? | RFC 2822 date. `nil` → auto-generated at send time |
-| `message_id` | string? | Message-ID header, e.g. `"<unique@host>"`. `nil` → auto-generated |
-| `in_reply_to` | string? | In-Reply-To header. `nil` if not a reply |
-| `references` | string? | References header (space-separated chain). `nil` if not a reply |
+| `date` | string | RFC 2822 date. Empty string `""` if not set (auto-generated at send time) |
+| `message_id` | string | Message-ID header, e.g. `"<unique@host>"`. Empty string `""` if not set |
+| `in_reply_to` | string | In-Reply-To header. Empty string `""` if not a reply |
+| `references` | string | References header (space-separated chain). Empty string `""` if not a reply |
 | `body_text` | string | Plain-text body of the email |
 | `headers` | table | Arbitrary extra headers, e.g. `{ ["X-Mailer"] = "lorebird" }` |
 
-**Example:**
+> **Note:** In Lua, `Option<String>` fields (`date`, `message_id`,
+> `in_reply_to`, `references`) are converted to empty strings rather than
+> `nil`, so hooks never need to nil-check these fields.
+
+**Example — modifying mail in an on_send hook:**
 
 ```lua
--- Print and modify a mail in an on_send hook
 on_send = function(profile, mail)
   print("Sending to: " .. mail.to)
   mail.headers["X-Custom"] = "added-by-hook"
@@ -49,29 +52,11 @@ on_send = function(profile, mail)
 end
 ```
 
-### parent
-
-A **parent table** represents the message you are replying to.  It is passed
-as the second argument to `on_reply` (read-only — modifications are ignored).
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `message_id` | string? | Message-ID of the parent, e.g. `"<original@example.com>"` |
-| `from` | string | Original sender |
-| `to` | string | Original recipients |
-| `cc` | string | Original Cc recipients |
-| `subject` | string | Original subject line |
-| `date` | string | Original date |
-| `references` | string | Original References header |
-| `in_reply_to` | string? | Original In-Reply-To header |
-| `body_text` | string | Original plain-text body |
-| `headers` | table | All original headers as key→value pairs |
-
-**Example:**
+**Example — inspecting parent in an on_reply hook:**
 
 ```lua
 on_reply = function(profile, parent, mail)
-  -- Inspect the original sender
+  -- parent has the same fields as mail (but read-only)
   if parent.from:find("bugzilla") then
     mail.cc = ""  -- drop Cc for automated messages
   end
@@ -389,15 +374,17 @@ profiles = {
 
 **Scope:** Global.  Defined at the top level of the config table.
 
-Called before the compose/reply window is shown.  The `mail` table is
-modifiable — changes are reflected in the compose window.
+Called before the compose/reply window is shown.  The `parent` and `mail`
+arguments both use the [mail](#mail) type.  `parent` is the message being
+replied to (treat it as read-only).  `mail` is the pre-filled reply and is
+**mutable** — changes are reflected in the compose window.
 
 **Parameters:**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `profile` | string | The profile label |
-| `parent` | table | The message being replied to (see [parent](#parent) type) |
+| `parent` | table | The message being replied to (see [mail](#mail) type, read-only) |
 | `mail` | table | The pre-filled reply (see [mail](#mail) type). **Mutable** |
 
 **Return value:** Optional.  Modifications to `mail` are picked up regardless
