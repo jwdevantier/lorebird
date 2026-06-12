@@ -6,14 +6,14 @@
 
 # Introduction
 Do you wish to interact with the QEMU- or Linux Kernel mailing lists? Are you looking for
-something a little easier to manage than a terminal mail reader (aerc, (neomutt), ...) with
+something a little easier to manage than a terminal mail reader (aerc, (neo)mutt, ...) with
 custom scripts for fetching mail through lei, indexing and search using notmuch and
 sending mail using a MTA like msmtp ?
 
 If so, Lorebird might be for you.
 
 This project has started in stages as I was fighting lei and later running out of
-energy trying to manage notmuch and my mailreader.
+energy trying to manage notmuch and my mail reader.
 
 
 Lorebird provides a graphical UI, shows mail organized by threads and is configured

@@ -26,7 +26,7 @@
     - and then call the threading code
 - Define query DSL parser
     - probably based on Xapian syntax
-    - find a way to map to a sqlite3 query, see loreread go demo
+    - find a way to map to a sqlite3 query, see lorebird go demo
 - Define sqlite3 integration
     - see https://youtu.be/eXMA_2dEMO0 -- define FTS5 tables, triggers for keeping in sync etc
     - would be ideal if index is maintained incrementally

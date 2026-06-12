@@ -1,0 +1,73 @@
+-- loreread configuration
+--
+-- This file defines mail profiles, views, and hooks.
+-- Copy to ~/.config/loreread/config.lua and edit.
+
+config = {
+  -- Theme: "light" (default) or "dark".
+  theme = "light",
+
+  -- UI scale factor: multiplies GTK's Xft DPI setting.
+  -- Defaults to 1.0 (no change).  Use 1.5 or 2.0 on HiDPI
+  -- or when running under WSL with no DPI detection.
+  -- ui_scale = 2.0,
+
+  -- Global identity — used as default for profiles that
+  -- don't define their own name / email.
+  user = {
+    name = "Your Name Here",
+    email = "you@example.com",
+  },
+
+  profiles = {
+    -- Each key is the profile label (displayed in the sidebar).
+    -- Duplicate labels are impossible by construction.
+    ["lore.kernel.org"] = {
+      -- Identity override (optional; falls back to global user.*)
+      -- name = "Your Name Here",
+      -- email = "you@example.com",
+
+      maildir = "/home/user/Mail/lore",
+
+      -- Fetch hook: called when the user clicks "Fetch".
+      -- Return truthy on success to trigger re-indexing.
+      on_fetch = function(label)
+        return sh({
+          "lorefetch",
+          "-query", "l:all",
+          "-maildir", "/home/user/Mail/lore",
+        }).ok
+      end,
+
+      views = {
+        { label = "last week",    query = "date:1w.." },
+        { label = "patches",      query = "subject:[PATCH]" },
+        { label = "from maintainer", query = "f:torvalds@linux-foundation.org" },
+      },
+    },
+
+    -- Add more profiles as needed:
+    -- ["work"] = {
+    --   name = "You (work)",
+    --   email = "you@company.com",
+    --   maildir = "/home/user/Mail/work",
+    --   on_fetch = function(label)
+    --     return sh({"offlineimap", "-a", "work"}).ok
+    --   end,
+    --   views = {},
+    -- },
+  },
+
+  -- Optional: customise the reply template.
+  -- `parent` is the message being replied to.
+  -- `mail` is the pre-filled reply (To, Cc, Subject, References, body).
+  -- Return `nil` to accept the default, or return a modified `mail` table.
+  -- on_reply = function(profile, parent, mail)
+  --   return mail  -- default; customise as needed
+  -- end,
+
+  -- Required: how to deliver outgoing mail.
+  on_send = function(profile, mail_fpath)
+    sh({"sendmail", "-t"}, { stdin_file = mail_fpath })
+  end,
+}

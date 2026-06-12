@@ -1276,7 +1276,7 @@ config = {
         let loaded = vm.load_config_string(code).unwrap();
         let on_send = loaded.global_hooks.on_send.as_ref().unwrap();
 
-        let mail = lorebird_core::compose::ComposeMail {
+        let mail = lorebird_core::compose::Mail {
             from: "Alice <alice@example.com>".to_string(),
             to: "Bob <bob@example.com>".to_string(),
             cc: String::new(),

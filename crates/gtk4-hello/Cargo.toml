@@ -1,0 +1,8 @@
+[package]
+name = "gtk4-hello"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gtk4 = "0.11"
+sourceview5 = "0.11"

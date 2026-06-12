@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=lorebird
+Comment=Lightweight mail reader for lore.kernel.org
+Exec=lorebird
+Icon=org.lorebird.app
+Type=Application
+Categories=Network;Email;
+StartupNotify=true

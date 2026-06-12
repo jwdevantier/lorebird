@@ -4,7 +4,7 @@ cargo test -p <crate> <mod>
 ```
 
 ```
-cargo test -p loreread-core thread
+cargo test -p lorebird-core thread
 ```
 
 

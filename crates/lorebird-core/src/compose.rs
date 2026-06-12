@@ -169,12 +169,12 @@ impl Mail {
         out
     }
 
-    /// Reconstruct a `ComposeMail` from a saved raw RFC 2822 message.
+    /// Reconstruct a `Mail` from a saved raw RFC 2822 message.
     ///
     /// Preserves `message_id` — it is the stable draft identity.
-    pub fn from_raw(raw: &[u8]) -> Option<ComposeMail> {
+    pub fn from_raw(raw: &[u8]) -> Option<Mail> {
         let m = crate::message::MailMessage::from_bytes(raw)?;
-        Some(ComposeMail {
+        Some(Mail {
             from: m.from_addr.unwrap_or_default(),
             to: m.to_addr.unwrap_or_default(),
             cc: m.cc_addr.unwrap_or_default(),
@@ -604,9 +604,9 @@ mod tests {
     #[test]
     fn from_raw_round_trip() {
         let parent = make_parent();
-        let mail = ComposeMail::new_reply(&parent, "Bob", "bob@example.com");
+        let mail = Mail::new_reply(&parent, "Bob", "bob@example.com");
         let raw = mail.to_rfc2822();
-        let back = ComposeMail::from_raw(raw.as_bytes()).unwrap();
+        let back = Mail::from_raw(raw.as_bytes()).unwrap();
         assert_eq!(back.subject, mail.subject);
         assert_eq!(back.to, mail.to);
         // The parser strips <> from Message-ID; the draft identity is bracket-insensitive.
@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn draft_id_uses_message_id() {
         let parent = make_parent();
-        let mail = ComposeMail::new_reply(&parent, "Bob", "bob@example.com");
+        let mail = Mail::new_reply(&parent, "Bob", "bob@example.com");
         assert_eq!(Some(mail.draft_id()), mail.message_id);
     }
 
