@@ -352,6 +352,10 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     // ── Context menu (right-click on thread list) ─────────────────
     let context_menu = gtk4::Popover::new();
+    // Parent the popover to the column_view so GTK knows which surface
+    // to realize it against. Without this, popup() aborts in
+    // gtk_widget_realize() because the popover has no parent widget.
+    context_menu.set_parent(&column_view);
     let reply_menu_btn = gtk4::Button::with_label("Reply");
     reply_menu_btn.add_css_class("flat");
     reply_menu_btn.set_margin_top(4);
@@ -377,11 +381,10 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     });
 
     // Right-click gesture on the column view
-    let ctx_menu_ref = context_menu;
+    let ctx_menu_ref = context_menu.clone();
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
-    gesture.connect_pressed(move |gesture, _n, x, y| {
-        let _widget = gesture.widget().unwrap();
+    gesture.connect_pressed(move |_gesture, _n, x, y| {
         let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
         ctx_menu_ref.set_pointing_to(Some(&rect));
         ctx_menu_ref.set_has_arrow(false);

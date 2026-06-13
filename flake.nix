@@ -42,6 +42,7 @@
             rust-analyzer
             clippy
             rustfmt
+            gdb
           ];
 
           shellHook = ''
