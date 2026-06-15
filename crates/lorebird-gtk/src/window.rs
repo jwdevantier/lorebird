@@ -410,6 +410,51 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     app.add_action(&reply_action);
     app.set_accels_for_action("app.reply", &["<Ctrl>R"]);
 
+    // ── Ctrl+S: focus search field ─────────────────────────────────
+    let search_ref = search_entry.clone();
+    let focus_search = gtk4::gio::SimpleAction::new("focus-search", None);
+    focus_search.connect_activate(move |_action, _param| {
+        search_ref.grab_focus();
+    });
+    app.add_action(&focus_search);
+    app.set_accels_for_action("app.focus-search", &["<Ctrl>s"]);
+
+    // ── Ctrl+T: focus thread list ──────────────────────────────────
+    let cv_ref = column_view.clone();
+    let focus_threads = gtk4::gio::SimpleAction::new("focus-threads", None);
+    focus_threads.connect_activate(move |_action, _param| {
+        cv_ref.grab_focus();
+    });
+    app.add_action(&focus_threads);
+    app.set_accels_for_action("app.focus-threads", &["<Ctrl>t"]);
+
+    // ── Left/Right arrows: expand/collapse thread nodes ────────────
+    let sel_for_keys = selection.clone();
+    let key_ctrl = gtk4::EventControllerKey::new();
+    key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    key_ctrl.connect_key_pressed(move |_, keyval, _, _| {
+        let pos = sel_for_keys.selected();
+        let item = sel_for_keys.model().and_then(|m| m.item(pos));
+        let Some(row) = item.and_downcast_ref::<TreeListRow>() else {
+            return glib::Propagation::Proceed;
+        };
+        if !row.is_expandable() {
+            return glib::Propagation::Proceed;
+        }
+        match keyval {
+            gtk4::gdk::Key::Right => {
+                row.set_expanded(true);
+                glib::Propagation::Stop
+            }
+            gtk4::gdk::Key::Left => {
+                row.set_expanded(false);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    });
+    column_view.add_controller(key_ctrl);
+
     window.present();
 }
 
