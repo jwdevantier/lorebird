@@ -162,6 +162,9 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     main_vbox.append(&status_label);
     window.set_child(Some(&main_vbox));
 
+    // ── Track the currently selected node ────────────
+    let selected_node: Rc<RefCell<Option<ThreadNode>>> = Rc::new(RefCell::new(None));
+
     // ── Track the active folder kind (for context menu sensitivity) ──
     let active_folder_kind: Rc<RefCell<FolderKind>> = Rc::new(RefCell::new(FolderKind::AllMail));
 
@@ -172,22 +175,25 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     reply_menu_btn.set_margin_bottom(4);
     reply_menu_btn.set_margin_start(8);
     reply_menu_btn.set_margin_end(8);
-    reply_menu_btn.set_sensitive(false); // enabled when viewing mail
     let edit_draft_btn = gtk4::Button::with_label("Edit Draft");
     edit_draft_btn.add_css_class("flat");
     edit_draft_btn.set_margin_top(4);
     edit_draft_btn.set_margin_bottom(4);
     edit_draft_btn.set_margin_start(8);
     edit_draft_btn.set_margin_end(8);
-    edit_draft_btn.set_sensitive(false); // enabled only when viewing drafts
+    let delete_draft_btn = gtk4::Button::with_label("Delete Draft");
+    delete_draft_btn.add_css_class("flat");
+    delete_draft_btn.set_margin_top(4);
+    delete_draft_btn.set_margin_bottom(4);
+    delete_draft_btn.set_margin_start(8);
+    delete_draft_btn.set_margin_end(8);
 
     // ── Wire sidebar selection → profile + view/search ──────
     let state_for_sidebar = state.clone();
     let status_for_sidebar = status_label.clone();
     let search_for_sidebar = search_entry.clone();
     let active_folder_kind_sidebar = active_folder_kind.clone();
-    let reply_menu_btn_clone = reply_menu_btn.clone();
-    let edit_draft_btn_clone = edit_draft_btn.clone();
+    let selected_node_sidebar = selected_node.clone();
     let reply_btn_sidebar = reply_btn.clone();
     let model = sidebar_model;
     sidebar_lb.connect_row_selected(move |_lb, row| {
@@ -208,9 +214,8 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
         *active_folder_kind_sidebar.borrow_mut() = kind;
 
-        // Update context menu and header button sensitivity based on folder kind.
-        reply_menu_btn_clone.set_sensitive(!matches!(kind, FolderKind::Drafts));
-        edit_draft_btn_clone.set_sensitive(matches!(kind, FolderKind::Drafts));
+        // Clear stale selection and update header button when switching folders.
+        *selected_node_sidebar.borrow_mut() = None;
         reply_btn_sidebar.set_sensitive(!matches!(kind, FolderKind::Drafts));
 
         let s = state_for_sidebar.borrow();
@@ -334,7 +339,6 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     });
 
     // ── Track the currently selected node for Reply ────────────
-    let selected_node: Rc<RefCell<Option<ThreadNode>>> = Rc::new(RefCell::new(None));
     let selected_node_clone = selected_node.clone();
     let reply_btn_ref = reply_btn.clone();
     let kind_ref = active_folder_kind.clone();
@@ -406,6 +410,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     context_menu.set_parent(&column_view);
     menu_box.append(&reply_menu_btn);
     menu_box.append(&edit_draft_btn);
+    menu_box.append(&delete_draft_btn);
     context_menu.set_child(Some(&menu_box));
 
     let state_for_ctx = state.clone();
@@ -444,11 +449,58 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         );
     });
 
+    let state_for_del = state.clone();
+    let selected_for_del = selected_node.clone();
+    let folder_kind_for_del = active_folder_kind.clone();
+    let status_for_del = status_label.clone();
+    let context_menu_for_del = context_menu.clone();
+    delete_draft_btn.connect_clicked(move |_btn| {
+        // Force-destroy the popover surface — model changes prevent
+        // popdown() from closing it.  It will be re-parented on the
+        // next right-click (see gesture handler).
+        context_menu_for_del.unparent();
+        trigger_delete_draft(
+            &state_for_del,
+            &selected_for_del,
+            &folder_kind_for_del,
+            &status_for_del,
+        );
+    });
+
     // Right-click gesture on the column view
     let ctx_menu_ref = context_menu.clone();
+    let column_view_for_gesture = column_view.clone();
+    let reply_menu_btn_gesture = reply_menu_btn.clone();
+    let edit_draft_btn_gesture = edit_draft_btn.clone();
+    let delete_draft_btn_gesture = delete_draft_btn.clone();
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
+    let selected_for_gesture = selected_node.clone();
+    let kind_for_gesture = active_folder_kind.clone();
     gesture.connect_pressed(move |_gesture, _n, x, y| {
+        // Don't show context menu if no row is selected.
+        if selected_for_gesture.borrow().is_none() {
+            return;
+        }
+
+        // Show only applicable entries based on folder kind.
+        match *kind_for_gesture.borrow() {
+            FolderKind::Drafts => {
+                reply_menu_btn_gesture.set_visible(false);
+                edit_draft_btn_gesture.set_visible(true);
+                delete_draft_btn_gesture.set_visible(true);
+            }
+            _ => {
+                reply_menu_btn_gesture.set_visible(true);
+                edit_draft_btn_gesture.set_visible(false);
+                delete_draft_btn_gesture.set_visible(false);
+            }
+        }
+
+        // Re-parent the popover if it was unparented after a draft deletion.
+        if ctx_menu_ref.parent().is_none() {
+            ctx_menu_ref.set_parent(&column_view_for_gesture);
+        }
         let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
         ctx_menu_ref.set_pointing_to(Some(&rect));
         ctx_menu_ref.set_has_arrow(false);
@@ -753,6 +805,84 @@ fn trigger_edit_draft(
         is_dark,
     };
     compose::open_compose_window(app, state, ctx);
+}
+
+/// Delete the currently selected draft from disk.
+/// Only works when viewing the Drafts folder.
+fn trigger_delete_draft(
+    state: &Rc<RefCell<AppState>>,
+    selected_node: &Rc<RefCell<Option<ThreadNode>>>,
+    active_folder_kind: &Rc<RefCell<FolderKind>>,
+    status_label: &Label,
+) {
+    if !matches!(*active_folder_kind.borrow(), FolderKind::Drafts) {
+        status_label.set_text("Select a draft in the Drafts folder first");
+        return;
+    }
+
+    let node = match selected_node.borrow().as_ref() {
+        Some(n) => n.clone(),
+        None => {
+            status_label.set_text("No draft selected — select a draft first");
+            return;
+        }
+    };
+
+    let s = state.borrow();
+    let profile_label = s.active_profile.borrow().clone();
+    if profile_label.is_empty() {
+        status_label.set_text("No profile selected — select a profile first");
+        return;
+    }
+    let profile = match s.profiles.get(&profile_label) {
+        Some(p) => p.clone(),
+        None => {
+            status_label.set_text(&format!("Profile '{}' not found", profile_label));
+            return;
+        }
+    };
+
+    let filename = node.filename();
+    if filename.is_empty() {
+        status_label.set_text("Draft has no file on disk");
+        return;
+    }
+
+    let raw = match std::fs::read(profile.maildir.join(&filename)) {
+        Ok(r) => r,
+        Err(e) => {
+            status_label.set_text(&format!("Cannot read draft: {}", e));
+            return;
+        }
+    };
+    let mail = match lorebird_core::compose::Mail::from_raw(&raw) {
+        Some(m) => m,
+        None => {
+            status_label.set_text("Cannot parse draft");
+            return;
+        }
+    };
+
+    let draft_id = mail.draft_id();
+    let drafts_dir = profile.maildir.join("Drafts");
+    match lorebird_core::maildir::delete_draft(&drafts_dir, &draft_id) {
+        Ok(()) => {
+            status_label.set_text(&format!("Deleted draft: {}", &filename));
+            // Remove just the deleted node from the model — no full rebuild.
+            let model = &s.root_model;
+            for i in (0..model.n_items()).rev() {
+                if let Some(item) = model.item(i).and_downcast::<ThreadNode>() {
+                    if item.filename() == node.filename() {
+                        model.remove(i);
+                        break;
+                    }
+                }
+            }
+            // Clear the stale selection.
+            *selected_node.borrow_mut() = None;
+        }
+        Err(e) => status_label.set_text(&format!("Failed to delete draft: {}", e)),
+    }
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────
