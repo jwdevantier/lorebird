@@ -145,6 +145,18 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
 
     window.set_child(Some(&vbox));
 
+    // Focus the body editor and place the cursor at the end.
+    body_view.grab_focus();
+    let end_iter = body_buffer.end_iter();
+    body_buffer.place_cursor(&end_iter);
+    // Scroll after the window is laid out (scroll_to_mark has no effect before realization).
+    let scroll_buffer = body_buffer.clone();
+    let scroll_view = body_view.clone();
+    glib::idle_add_local_once(move || {
+        let mark = scroll_buffer.get_insert();
+        scroll_view.scroll_to_mark(&mark, 0.0, true, 0.0, 1.0);
+    });
+
     // ── Save Draft button handler ───────────────────────────────
     // Clone the field widgets first; the Send closure moves its copies.
     let save_from = from_entry.clone();
