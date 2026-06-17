@@ -410,6 +410,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
     let state_for_ctx = state.clone();
     let selected_for_ctx = selected_node.clone();
+    let kind_for_ctx = active_folder_kind.clone();
     let status_for_ctx = status_label.clone();
     let app_for_ctx = app.clone();
     let context_menu_for_btn = context_menu.clone();
@@ -418,6 +419,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         trigger_reply(
             &state_for_ctx,
             &selected_for_ctx,
+            &kind_for_ctx,
             &app_for_ctx,
             &status_for_ctx,
             is_dark,
@@ -457,12 +459,14 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // ── Reply button in header bar ─────────────────────────────────
     let state_for_reply_btn = state.clone();
     let selected_for_reply_btn = selected_node.clone();
+    let kind_for_reply_btn = active_folder_kind.clone();
     let status_for_reply_btn = status_label.clone();
     let app_for_reply_btn = app.clone();
     reply_btn.connect_clicked(move |_| {
         trigger_reply(
             &state_for_reply_btn,
             &selected_for_reply_btn,
+            &kind_for_reply_btn,
             &app_for_reply_btn,
             &status_for_reply_btn,
             is_dark,
@@ -472,6 +476,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // ── Ctrl+R keybind for Reply ───────────────────────────────────
     let state_for_reply = state.clone();
     let selected_for_reply = selected_node.clone();
+    let kind_for_reply = active_folder_kind.clone();
     let status_for_reply = status_label.clone();
     let app_for_reply = app.clone();
     let reply_action = gtk4::gio::SimpleAction::new("reply", None);
@@ -479,6 +484,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         trigger_reply(
             &state_for_reply,
             &selected_for_reply,
+            &kind_for_reply,
             &app_for_reply,
             &status_for_reply,
             is_dark,
@@ -544,10 +550,15 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 fn trigger_reply(
     state: &Rc<RefCell<AppState>>,
     selected_node: &Rc<RefCell<Option<ThreadNode>>>,
+    active_folder_kind: &Rc<RefCell<FolderKind>>,
     app: &gtk4::Application,
     status_label: &Label,
     is_dark: bool,
 ) {
+    if matches!(*active_folder_kind.borrow(), FolderKind::Drafts) {
+        status_label.set_text("Reply is not available in the Drafts folder");
+        return;
+    }
     let node = match selected_node.borrow().as_ref() {
         Some(n) => n.clone(),
         None => {
