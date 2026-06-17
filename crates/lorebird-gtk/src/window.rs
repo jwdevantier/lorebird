@@ -23,7 +23,7 @@ use sourceview5::prelude::*;
 
 use crate::app_state::AppState;
 use crate::compose::{self, ComposeContext};
-use crate::folder_item::FolderItem;
+use crate::folder_item::{FolderItem, FolderKind};
 use crate::lua_thread::LuaCommand;
 use crate::thread_node::ThreadNode;
 use lorebird_core::compose::Mail;
@@ -162,14 +162,33 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     main_vbox.append(&status_label);
     window.set_child(Some(&main_vbox));
 
-    // ── Track the active folder kind (for the Edit Draft action) ──
-    let active_folder_kind: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    // ── Track the active folder kind (for context menu sensitivity) ──
+    let active_folder_kind: Rc<RefCell<FolderKind>> = Rc::new(RefCell::new(FolderKind::AllMail));
+
+    // Context menu buttons (created early so the sidebar callback can update sensitivity).
+    let reply_menu_btn = gtk4::Button::with_label("Reply");
+    reply_menu_btn.add_css_class("flat");
+    reply_menu_btn.set_margin_top(4);
+    reply_menu_btn.set_margin_bottom(4);
+    reply_menu_btn.set_margin_start(8);
+    reply_menu_btn.set_margin_end(8);
+    reply_menu_btn.set_sensitive(false); // enabled when viewing mail
+    let edit_draft_btn = gtk4::Button::with_label("Edit Draft");
+    edit_draft_btn.add_css_class("flat");
+    edit_draft_btn.set_margin_top(4);
+    edit_draft_btn.set_margin_bottom(4);
+    edit_draft_btn.set_margin_start(8);
+    edit_draft_btn.set_margin_end(8);
+    edit_draft_btn.set_sensitive(false); // enabled only when viewing drafts
 
     // ── Wire sidebar selection → profile + view/search ──────
     let state_for_sidebar = state.clone();
     let status_for_sidebar = status_label.clone();
     let search_for_sidebar = search_entry.clone();
     let active_folder_kind_sidebar = active_folder_kind.clone();
+    let reply_menu_btn_clone = reply_menu_btn.clone();
+    let edit_draft_btn_clone = edit_draft_btn.clone();
+    let reply_btn_sidebar = reply_btn.clone();
     let model = sidebar_model;
     sidebar_lb.connect_row_selected(move |_lb, row| {
         let Some(row) = row else { return };
@@ -180,19 +199,24 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
 
         let profile = item.profile_label();
         let query = item.query();
-        let kind = item.row_kind();
+        let kind = FolderKind::from_str(&item.row_kind()).unwrap_or(FolderKind::Placeholder);
 
         // Filter out non-interactive rows
-        if kind == "separator" || kind == "placeholder" {
+        if matches!(kind, FolderKind::Separator | FolderKind::Placeholder) {
             return;
         }
 
-        *active_folder_kind_sidebar.borrow_mut() = kind.to_string();
+        *active_folder_kind_sidebar.borrow_mut() = kind;
+
+        // Update context menu and header button sensitivity based on folder kind.
+        reply_menu_btn_clone.set_sensitive(!matches!(kind, FolderKind::Drafts));
+        edit_draft_btn_clone.set_sensitive(matches!(kind, FolderKind::Drafts));
+        reply_btn_sidebar.set_sensitive(!matches!(kind, FolderKind::Drafts));
 
         let s = state_for_sidebar.borrow();
 
-        match kind.as_str() {
-            "profile-header" => {
+        match kind {
+            FolderKind::ProfileHeader => {
                 s.select_profile(&profile);
                 // Clear any active search
                 search_for_sidebar.set_text("");
@@ -201,7 +225,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                     profile
                 ));
             }
-            "all-mail" => {
+            FolderKind::AllMail => {
                 s.select_profile(&profile);
 
                 // Open existing DB if available
@@ -224,7 +248,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 }
                 search_for_sidebar.set_text("");
             }
-            "drafts" => {
+            FolderKind::Drafts => {
                 s.select_profile(&profile);
                 match s.show_drafts() {
                     Ok(n) => status_for_sidebar
@@ -233,7 +257,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
                 }
                 search_for_sidebar.set_text("");
             }
-            "view" => {
+            FolderKind::View => {
                 s.select_profile(&profile);
 
                 // Open existing DB if available
@@ -313,13 +337,16 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let selected_node: Rc<RefCell<Option<ThreadNode>>> = Rc::new(RefCell::new(None));
     let selected_node_clone = selected_node.clone();
     let reply_btn_ref = reply_btn.clone();
+    let kind_ref = active_folder_kind.clone();
     selection.connect_selection_changed(move |sel, _pos, _n| {
         if let Some(obj) = sel.selected_item()
             && let Some(row) = obj.downcast_ref::<TreeListRow>()
             && let Some(node) = row.item().and_downcast::<ThreadNode>()
         {
             *selected_node_clone.borrow_mut() = Some(node);
-            reply_btn_ref.set_sensitive(true);
+            // Reply is only sensitive when viewing mail, not drafts.
+            reply_btn_ref
+                .set_sensitive(!matches!(*kind_ref.borrow(), FolderKind::Drafts));
         } else {
             *selected_node_clone.borrow_mut() = None;
             reply_btn_ref.set_sensitive(false);
@@ -376,20 +403,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // ── Context menu (right-click on thread list) ─────────────────
     let context_menu = gtk4::Popover::new();
     let menu_box = Box::new(Orientation::Vertical, 0);
-    // Must parent before popup(): an unparented GTK4 popover segfaults on popup().
     context_menu.set_parent(&column_view);
-    let reply_menu_btn = gtk4::Button::with_label("Reply");
-    reply_menu_btn.add_css_class("flat");
-    reply_menu_btn.set_margin_top(4);
-    reply_menu_btn.set_margin_bottom(4);
-    reply_menu_btn.set_margin_start(8);
-    reply_menu_btn.set_margin_end(8);
-    let edit_draft_btn = gtk4::Button::with_label("Edit Draft");
-    edit_draft_btn.add_css_class("flat");
-    edit_draft_btn.set_margin_top(4);
-    edit_draft_btn.set_margin_bottom(4);
-    edit_draft_btn.set_margin_start(8);
-    edit_draft_btn.set_margin_end(8);
     menu_box.append(&reply_menu_btn);
     menu_box.append(&edit_draft_btn);
     context_menu.set_child(Some(&menu_box));
@@ -670,12 +684,12 @@ fn trigger_reply(
 fn trigger_edit_draft(
     state: &Rc<RefCell<AppState>>,
     selected_node: &Rc<RefCell<Option<ThreadNode>>>,
-    active_folder_kind: &Rc<RefCell<String>>,
+    active_folder_kind: &Rc<RefCell<FolderKind>>,
     app: &gtk4::Application,
     status_label: &Label,
     is_dark: bool,
 ) {
-    if *active_folder_kind.borrow() != "drafts" {
+    if !matches!(*active_folder_kind.borrow(), FolderKind::Drafts) {
         status_label.set_text("Select a draft in the Drafts folder first");
         return;
     }
@@ -798,8 +812,8 @@ fn make_sidebar_row(item: &FolderItem) -> ListBoxRow {
     hbox.set_margin_end(8);
 
     // Separators and placeholders are non-selectable
-    let kind = item.row_kind();
-    if kind == "separator" {
+    let kind = FolderKind::from_str(&item.row_kind()).unwrap_or(FolderKind::Placeholder);
+    if matches!(kind, FolderKind::Separator) {
         let sep = gtk4::Separator::new(Orientation::Horizontal);
         hbox.append(&sep);
         let row = ListBoxRow::new();
@@ -810,7 +824,7 @@ fn make_sidebar_row(item: &FolderItem) -> ListBoxRow {
         return row;
     }
 
-    if kind == "placeholder" {
+    if matches!(kind, FolderKind::Placeholder) {
         let label = Label::new(Some(&item.name()));
         label.set_justify(gtk4::Justification::Center);
         label.add_css_class("dim-label");
@@ -835,7 +849,7 @@ fn make_sidebar_row(item: &FolderItem) -> ListBoxRow {
     let label = Label::new(Some(&item.name()));
     label.set_hexpand(true);
     label.set_xalign(0.0);
-    if kind == "profile-header" {
+    if matches!(kind, FolderKind::ProfileHeader) {
         label.add_css_class("heading");
         label.add_css_class("caption");
     }
@@ -852,7 +866,7 @@ fn make_sidebar_row(item: &FolderItem) -> ListBoxRow {
     let row = ListBoxRow::new();
     row.set_child(Some(&hbox));
 
-    if kind == "profile-header" {
+    if matches!(kind, FolderKind::ProfileHeader) {
         // Headers are selectable (they set the active profile)
     }
 

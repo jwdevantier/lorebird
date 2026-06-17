@@ -27,8 +27,7 @@ mod imp {
         /// Query string for view rows (empty for non-view rows).
         #[property(get, set)]
         query: RefCell<String>,
-        /// Row kind: "profile-header", "all-mail", "view",
-        /// "separator", or "placeholder".
+        /// Row kind, stored as the string representation of [`FolderKind`].
         #[property(get, set)]
         row_kind: RefCell<String>,
     }
@@ -47,6 +46,46 @@ glib::wrapper! {
     pub struct FolderItem(ObjectSubclass<imp::FolderItemInner>);
 }
 
+/// The kind of sidebar row. Used instead of bare strings so the
+/// compiler catches typos and every variant is documented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderKind {
+    ProfileHeader,
+    AllMail,
+    Drafts,
+    View,
+    Separator,
+    Placeholder,
+}
+
+impl FolderKind {
+    /// The string stored in the GObject `row-kind` property.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProfileHeader => "profile-header",
+            Self::AllMail => "all-mail",
+            Self::Drafts => "drafts",
+            Self::View => "view",
+            Self::Separator => "separator",
+            Self::Placeholder => "placeholder",
+        }
+    }
+
+    /// Parse a row-kind string back into a FolderKind.
+    /// Returns None for unrecognised values.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "profile-header" => Some(Self::ProfileHeader),
+            "all-mail" => Some(Self::AllMail),
+            "drafts" => Some(Self::Drafts),
+            "view" => Some(Self::View),
+            "separator" => Some(Self::Separator),
+            "placeholder" => Some(Self::Placeholder),
+            _ => None,
+        }
+    }
+}
+
 impl FolderItem {
     /// Create a profile header row.
     pub fn profile_header(label: &str) -> Self {
@@ -57,7 +96,7 @@ impl FolderItem {
             .property("is-header", true)
             .property("profile-label", label)
             .property("query", "")
-            .property("row-kind", "profile-header")
+            .property("row-kind", FolderKind::ProfileHeader.as_str())
             .build()
     }
 
@@ -70,7 +109,7 @@ impl FolderItem {
             .property("is-header", false)
             .property("profile-label", profile_label)
             .property("query", "")
-            .property("row-kind", "all-mail")
+            .property("row-kind", FolderKind::AllMail.as_str())
             .build()
     }
 
@@ -83,7 +122,7 @@ impl FolderItem {
             .property("is-header", false)
             .property("profile-label", profile_label)
             .property("query", "")
-            .property("row-kind", "drafts")
+            .property("row-kind", FolderKind::Drafts.as_str())
             .build()
     }
 
@@ -96,7 +135,7 @@ impl FolderItem {
             .property("is-header", false)
             .property("profile-label", profile_label)
             .property("query", query)
-            .property("row-kind", "view")
+            .property("row-kind", FolderKind::View.as_str())
             .build()
     }
 
@@ -109,7 +148,7 @@ impl FolderItem {
             .property("is-header", false)
             .property("profile-label", "")
             .property("query", "")
-            .property("row-kind", "separator")
+            .property("row-kind", FolderKind::Separator.as_str())
             .build()
     }
 
@@ -122,7 +161,7 @@ impl FolderItem {
             .property("is-header", false)
             .property("profile-label", "")
             .property("query", "")
-            .property("row-kind", "placeholder")
+            .property("row-kind", FolderKind::Placeholder.as_str())
             .build()
     }
 }
