@@ -156,6 +156,7 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
     let save_profile = profile_label.clone();
     let save_status = status_label.clone();
     let save_mail = mail.clone();
+    let save_window = window.clone();
     save_draft_btn.connect_clicked(move |_btn| {
         let body_start = save_buffer.start_iter();
         let body_end = save_buffer.end_iter();
@@ -193,6 +194,7 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
                 save_status.set_text("Draft saved");
                 save_status.remove_css_class("error");
                 save_status.add_css_class("dim-label");
+                save_window.close();
             }
             Err(e) => {
                 save_status.set_text(&format!("Draft save failed: {}", e));
