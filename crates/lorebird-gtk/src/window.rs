@@ -69,6 +69,10 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     let refresh_btn = gtk4::Button::from_icon_name("view-refresh");
     refresh_btn.set_tooltip_text(Some("Refresh mail"));
 
+    let reply_btn = gtk4::Button::with_label("Reply");
+    reply_btn.set_tooltip_text(Some("Reply (Ctrl+R)"));
+    reply_btn.set_sensitive(false); // greyed out until a message is selected
+
     // ── Spinner (shown during async fetch) ─────────────────────
     let spinner = Spinner::new();
     spinner.set_spinning(false);
@@ -121,6 +125,7 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     });
 
     header.pack_end(&refresh_btn);
+    header.pack_end(&reply_btn);
     header.pack_end(&spinner);
     window.set_titlebar(Some(&header));
 
@@ -292,14 +297,17 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
     // ── Track the currently selected node for Reply ────────────
     let selected_node: Rc<RefCell<Option<ThreadNode>>> = Rc::new(RefCell::new(None));
     let selected_node_clone = selected_node.clone();
+    let reply_btn_ref = reply_btn.clone();
     selection.connect_selection_changed(move |sel, _pos, _n| {
         if let Some(obj) = sel.selected_item()
             && let Some(row) = obj.downcast_ref::<TreeListRow>()
             && let Some(node) = row.item().and_downcast::<ThreadNode>()
         {
             *selected_node_clone.borrow_mut() = Some(node);
+            reply_btn_ref.set_sensitive(true);
         } else {
             *selected_node_clone.borrow_mut() = None;
+            reply_btn_ref.set_sensitive(false);
         }
     });
 
@@ -391,6 +399,21 @@ pub fn build_window(app: &Application, state: &Rc<RefCell<AppState>>) {
         ctx_menu_ref.popup();
     });
     column_view.add_controller(gesture);
+
+    // ── Reply button in header bar ─────────────────────────────────
+    let state_for_reply_btn = state.clone();
+    let selected_for_reply_btn = selected_node.clone();
+    let status_for_reply_btn = status_label.clone();
+    let app_for_reply_btn = app.clone();
+    reply_btn.connect_clicked(move |_| {
+        trigger_reply(
+            &state_for_reply_btn,
+            &selected_for_reply_btn,
+            &app_for_reply_btn,
+            &status_for_reply_btn,
+            is_dark,
+        );
+    });
 
     // ── Ctrl+R keybind for Reply ───────────────────────────────────
     let state_for_reply = state.clone();
