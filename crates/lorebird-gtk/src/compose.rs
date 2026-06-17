@@ -21,6 +21,7 @@ use lorebird_core::compose::Mail;
 use crate::app_state::AppState;
 use crate::lua_thread::LuaCommand;
 use crate::lua_thread::LuaResult;
+use crate::thread_node::ThreadNode;
 
 // ── Data passed from the reply trigger to the compose window ────────
 
@@ -276,6 +277,12 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
         let poll_status = status_label.clone();
         let poll_btn = send_btn_ref.clone();
         let poll_window = send_window.clone();
+        // If this compose was for a draft, clean it up after successful send.
+        let draft_id = mail.draft_id();
+        let drafts_dir = {
+            let s = send_state.borrow();
+            s.profiles.get(&send_profile).map(|p| p.maildir.join("Drafts"))
+        };
         glib::timeout_add_local(Duration::from_millis(100), move || {
             let s = poll_state.borrow();
             match s.poll_fetch_result() {
@@ -290,6 +297,22 @@ pub fn open_compose_window(app: &gtk4::Application, state: &Rc<RefCell<AppState>
                         poll_status.set_text("Message sent successfully");
                         poll_status.remove_css_class("error");
                         poll_status.add_css_class("dim-label");
+                        // Remove the draft if this was composed from one.
+                        if let Some(ref dir) = drafts_dir {
+                            let _ = lorebird_core::maildir::delete_draft(dir, &draft_id);
+                        }
+                        // Also remove it from the in-memory model.
+                        {
+                            let s = poll_state.borrow();
+                            for i in (0..s.root_model.n_items()).rev() {
+                                if let Some(item) = s.root_model.item(i).and_downcast::<ThreadNode>() {
+                                    if item.message_id() == draft_id {
+                                        s.root_model.remove(i);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         // Close the compose window after successful send
                         poll_window.close();
                     }
